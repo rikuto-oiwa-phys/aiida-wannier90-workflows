@@ -135,6 +135,130 @@ def plot_scdm_fit(  # pylint: disable=too-many-locals
         plt.show()
 
 
+def plot_cwf_fit_raw(  # pylint: disable=too-many-arguments
+    energies: ty.Sequence,
+    projectability: ty.Sequence,
+    fit_mu_min: float,
+    fit_mu_max: float,
+    fit_sigma_min: float,
+    fit_sigma_max: float,
+    opt_mu_min: float,
+    opt_mu_max: float,
+    opt_sigma_min: float,
+    opt_sigma_max: float,
+    delta: float,
+    fermi_energy: float = None,
+    *,
+    title: str = None,
+    ax: plt.Axes = None,
+) -> plt.Axes:
+    """Plot the Closest Wannier fitting."""
+    from aiida_wannier90_workflows.utils.cwf import cwf_window_function
+
+    if ax is None:
+        _, ax = plt.subplots()
+
+    ax.plot(energies, projectability, "o", label="Projectability")
+    ax.plot(
+        energies,
+        cwf_window_function(
+            energies, fit_mu_min, fit_mu_max, fit_sigma_min, fit_sigma_max, delta
+        ),
+        label="CWF fit",
+    )
+    ax.plot(
+        energies,
+        cwf_window_function(
+            energies, opt_mu_min, opt_mu_max, opt_sigma_min, opt_sigma_max, delta
+        ),
+        linestyle="--",
+        label="CWF opt",
+    )
+
+    ax.axvline([fit_mu_min], color="red", linestyle=":", label=r"$\mu_\mathrm{min}$")
+    ax.axvline([fit_mu_max], color="red", label=r"$\mu_\mathrm{max,fit}$")
+    ax.axvline([opt_mu_max], color="orange", label=r"$\mu_\mathrm{max,opt}$")
+
+    if fermi_energy is not None:
+        ax.axvline([fermi_energy], color="green", label=r"$E_f$")
+
+    if title is None:
+        title = "Closest Wannier fitting"
+    ax.set_title(title)
+    ax.set_xlabel("Energy [eV]")
+    ax.set_ylabel("Projectability / weight")
+    ax.legend(loc="best")
+
+    return ax
+
+
+def plot_cwf_fit(workchain: int, save: bool = False):  # pylint: disable=too-many-locals
+    """Plot the projectability distribution of Closest Wannier fitting."""
+    from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters
+    from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
+
+    valid_classes = [
+        Wannier90BandsWorkChain,
+        Wannier90OptimizeWorkChain,
+        Wannier90WorkChain,
+    ]
+    if workchain.process_class not in valid_classes:
+        raise ValueError(f"Input workchain type should be {valid_classes}")
+
+    formula = workchain.inputs.structure.get_formula()
+
+    p2w_workchain = (
+        workchain.base.links.get_outgoing(link_label_filter="pw2wannier90").one().node
+    )
+    p2wcalc = get_last_calcjob(p2w_workchain)
+
+    w90_workchain = (
+        workchain.base.links.get_outgoing(link_label_filter="wannier90").one().node
+    )
+    w90calc = get_last_calcjob(w90_workchain)
+
+    eig_content = p2wcalc.outputs.retrieved.get_object_content("aiida.eig")
+    amn_content = p2wcalc.outputs.retrieved.get_object_content("aiida.amn")
+
+    parameters = w90calc.inputs.parameters.get_dict()
+    sigma_factor = getattr(workchain.inputs, "cwf_sigma_factor", orm.Float(3.0)).value
+    delta = parameters.get("cwf_delta", 1e-12)
+
+    opt_parameters, fit_data = fit_cwf_parameters(
+        eig_content=eig_content,
+        amn_content=amn_content,
+        sigma_factor=sigma_factor,
+        delta=delta,
+        return_data=True,
+    )
+
+    fermi_energy = parameters.get("fermi_energy", None)
+
+    _, ax = plt.subplots()
+    title = f"{workchain.process_label}<{workchain.pk}>: {formula}"
+    plot_cwf_fit_raw(
+        fit_data["energies"],
+        fit_data["projectability"],
+        fit_data["fit_mu_min"],
+        fit_data["fit_mu_max"],
+        fit_data["fit_sigma_min"],
+        fit_data["fit_sigma_max"],
+        opt_parameters["cwf_mu_min"],
+        opt_parameters["cwf_mu_max"],
+        opt_parameters["cwf_sigma_min"],
+        opt_parameters["cwf_sigma_max"],
+        fit_data["delta"],
+        fermi_energy,
+        title=title,
+        ax=ax,
+    )
+
+    if save:
+        plt.savefig(f"cwffit_{formula}_{workchain.pk}.png")
+    else:
+        plt.show()
+
+
 def get_mpl_code_for_bands(
     dft_bands,
     wan_bands,

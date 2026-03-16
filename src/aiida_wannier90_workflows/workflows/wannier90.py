@@ -159,6 +159,9 @@ class Wannier90WorkChain(
             cls.inspect_wannier90_pp,
             cls.run_pw2wannier90,
             cls.inspect_pw2wannier90,
+            if_(cls.should_fit_cwf_parameters)(
+                cls.fit_cwf_parameters,
+            ),
             cls.run_wannier90,
             cls.inspect_wannier90,
             cls.results,
@@ -178,6 +181,37 @@ class Wannier90WorkChain(
         spec.expose_outputs(Pw2wannier90BaseWorkChain, namespace="pw2wannier90")
         spec.expose_outputs(Wannier90BaseWorkChain, namespace="wannier90_pp")
         spec.expose_outputs(Wannier90BaseWorkChain, namespace="wannier90")
+        spec.output(
+            "cwf_parameters",
+            valid_type=orm.Dict,
+            required=False,
+            help="Automatically fitted Closest Wannier parameters.",
+        )
+
+        spec.input(
+            "auto_cwf_parameters",
+            valid_type=orm.Bool,
+            serializer=to_aiida_type,
+            default=lambda: orm.Bool(False),
+            help=(
+                "If True, fit CWF parameters from retrieved `aiida.eig` and "
+                "`aiida.amn` before the final Wannier90 run."
+            ),
+        )
+        spec.input(
+            "cwf_sigma_factor",
+            valid_type=orm.Float,
+            serializer=to_aiida_type,
+            default=lambda: orm.Float(3.0),
+            help="Shift factor applied to the fitted `mu_max`.",
+        )
+        spec.input(
+            "cwf_delta",
+            valid_type=orm.Float,
+            serializer=to_aiida_type,
+            default=lambda: orm.Float(1e-12),
+            help="Value written to the Wannier90 input as `cwf_delta`.",
+        )
 
         spec.exit_code(
             420,
@@ -203,6 +237,19 @@ class Wannier90WorkChain(
             460,
             "ERROR_SUB_PROCESS_FAILED_PW2WANNIER90",
             message="the Pw2wannier90BaseWorkChain sub process failed",
+        )
+        spec.exit_code(
+            465,
+            "ERROR_CWF_FILES_MISSING",
+            message=(
+                "the retrieved `aiida.eig` or `aiida.amn` file required for "
+                "CWF fitting is missing"
+            ),
+        )
+        spec.exit_code(
+            466,
+            "ERROR_CWF_FITTING_FAILED",
+            message="fitting the Closest Wannier parameters failed",
         )
         spec.exit_code(
             470,
@@ -701,6 +748,20 @@ class Wannier90WorkChain(
                 raise ValueError("Cannot retrieve Fermi energy from scf or nscf output")
         parameters["fermi_energy"] = fermi_energy
 
+        if self.should_fit_cwf_parameters():
+            parameters["auto_projections"] = True
+            for key in (
+                "dis_proj_min",
+                "dis_proj_max",
+                "dis_froz_min",
+                "dis_froz_max",
+                "dis_win_min",
+                "dis_win_max",
+            ):
+                parameters.pop(key, None)
+            inputs.pop("projections", None)
+            base_inputs.pop("guiding_centres_projections", None)
+
         inputs.parameters = orm.Dict(parameters)
 
         # Add `postproc_setup`
@@ -791,6 +852,22 @@ class Wannier90WorkChain(
                 self.ctx.workchain_projwfc.outputs.projections
             )
 
+        if self.should_fit_cwf_parameters():
+            parameters["atom_proj"] = True
+
+            if "settings" in inputs:
+                settings = inputs.settings.get_dict()
+            else:
+                settings = {}
+
+            retrieve_list = list(settings.get("additional_retrieve_list", []))
+            for filename in ("aiida.amn", "aiida.eig"):
+                if filename not in retrieve_list:
+                    retrieve_list.append(filename)
+            settings["additional_retrieve_list"] = retrieve_list
+            inputs.settings = orm.Dict(settings)
+            inputs.parameters = orm.Dict({"inputpp": parameters})
+
         inputs["parent_folder"] = self.ctx.current_folder
         inputs["nnkp_file"] = self.ctx.workchain_wannier90_pp.outputs.nnkp_file
 
@@ -820,6 +897,50 @@ class Wannier90WorkChain(
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_PW2WANNIER90
 
         self.ctx.current_folder = workchain.outputs.remote_folder
+
+    def should_fit_cwf_parameters(self):
+        """Return whether Closest Wannier parameters should be fitted."""
+        return self.inputs.auto_cwf_parameters.value
+
+    def fit_cwf_parameters(self):  # pylint: disable=inconsistent-return-statements
+        """Fit Closest Wannier parameters from the retrieved pw2wannier90 files."""
+        from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters_from_contents
+        from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
+
+        last_calc = get_last_calcjob(self.ctx.workchain_pw2wannier90)
+        if last_calc is None or "retrieved" not in last_calc.outputs:
+            self.report(
+                "cannot fit CWF parameters because the pw2wannier90 retrieved "
+                "folder is unavailable"
+            )
+            return self.exit_codes.ERROR_CWF_FILES_MISSING
+
+        try:
+            eig_content = last_calc.outputs.retrieved.get_object_content("aiida.eig")
+            amn_content = last_calc.outputs.retrieved.get_object_content("aiida.amn")
+        except (IOError, OSError, KeyError):
+            self.report(
+                "cannot fit CWF parameters because `aiida.eig` or `aiida.amn` "
+                "was not retrieved"
+            )
+            return self.exit_codes.ERROR_CWF_FILES_MISSING
+
+        try:
+            parameters = fit_cwf_parameters_from_contents(
+                eig_content=eig_content,
+                amn_content=amn_content,
+                sigma_factor=self.inputs.cwf_sigma_factor.value,
+                delta=self.inputs.cwf_delta.value,
+            )
+        except (RuntimeError, TypeError, ValueError) as exception:
+            self.report(f"CWF fitting failed: {exception}")
+            return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+        self.ctx.cwf_parameters = orm.Dict(dict=parameters)
+        self.report(
+            "fitted CWF parameters: "
+            + ", ".join(f"{key}={value:.8f}" for key, value in parameters.items())
+        )
 
     def prepare_wannier90_inputs(self):  # pylint: disable=too-many-statements
         """Prepare the inputs of wannier90 calculation before submission.
@@ -866,6 +987,30 @@ class Wannier90WorkChain(
         settings["postproc_setup"] = False
 
         inputs.settings = settings
+
+        if self.should_fit_cwf_parameters():
+            parameters = inputs.parameters.get_dict()
+            parameters["auto_projections"] = True
+            parameters["num_iter"] = 0
+            parameters["dis_num_iter"] = 0
+            parameters["use_cwf_method"] = True
+            parameters["cwf_delta"] = self.inputs.cwf_delta.value
+            for key in (
+                "guiding_centres",
+                "dis_proj_min",
+                "dis_proj_max",
+                "dis_froz_min",
+                "dis_froz_max",
+                "dis_win_min",
+                "dis_win_max",
+            ):
+                parameters.pop(key, None)
+            for key, value in self.ctx.cwf_parameters.get_dict().items():
+                if key not in parameters:
+                    parameters[key] = value
+            inputs.pop("projections", None)
+            base_inputs.pop("guiding_centres_projections", None)
+            inputs.parameters = orm.Dict(parameters)
 
         # Restore stash files
         if stash:
@@ -948,6 +1093,8 @@ class Wannier90WorkChain(
                 namespace="wannier90",
             )
         )
+        if "cwf_parameters" in self.ctx:
+            self.out("cwf_parameters", self.ctx.cwf_parameters)
 
         result = self.sanity_check()
         if result:

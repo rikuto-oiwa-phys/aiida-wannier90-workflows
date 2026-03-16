@@ -35,6 +35,22 @@ def cmd_plot_scdm(workchain, save):
     plot_scdm_fit(workchain, save)
 
 
+@cmd_plot.command("cwf")
+@click.argument("workchain", type=NodeParamType(), nargs=1)
+@click.option(
+    "-s",
+    "--save",
+    default=False,
+    help="save as a PNG instead of showing matplotlib window",
+)
+@decorators.with_dbenv()
+def cmd_plot_cwf(workchain, save):
+    """Plot Closest Wannier projectability fitting."""
+    from aiida_wannier90_workflows.utils.workflows.plot.bands import plot_cwf_fit
+
+    plot_cwf_fit(workchain, save)
+
+
 @cmd_plot.command("band")
 @click.argument("node", type=NodeParamType(), nargs=1)
 @click.option(
