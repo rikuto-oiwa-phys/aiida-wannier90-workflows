@@ -6,6 +6,233 @@ import numpy as np
 import pandas as pd
 
 from aiida import orm
+from aiida.common.links import LinkType
+
+
+def _safe_get_nested_output(node, path: ty.Iterable[str]):
+    """Return nested output if available, otherwise ``None``."""
+    try:
+        current = node.outputs
+    except AttributeError:
+        return None
+    try:
+        for part in path:
+            current = current[part]
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return current
+
+
+def _iter_called_descendants_with_labels(node):
+    """Yield direct called descendants as ``(label, node)`` pairs."""
+    for link in node.base.links.get_outgoing().all():
+        if link.link_type not in (LinkType.CALL_CALC, LinkType.CALL_WORK):
+            continue
+        yield link.link_label, link.node
+
+
+def _get_called_descendants_by_prefix(node, prefix: str):
+    """Return called descendants whose call link label starts with ``prefix``."""
+    matches = []
+    for label, child in _iter_called_descendants_with_labels(node):
+        if label.startswith(prefix):
+            matches.append((label, child))
+    matches.sort(key=lambda item: item[0])
+    return matches
+
+
+def _get_bands_shape_product(bands):
+    """Return the product of the stored bands shape, or ``None`` if unavailable."""
+    try:
+        return np.prod(bands.base.attributes.all["array|bands"])
+    except (KeyError, TypeError):
+        return None
+
+
+def _append_bands_candidate(candidates, source: str, bands):
+    """Append a bands candidate if present."""
+    if bands is not None:
+        candidates.append((source, bands))
+
+
+def _get_resolved_fermi_energy(workchain):
+    """Get Fermi energy for bands distance, rescuing from child workchains if needed."""
+    from aiida.plugins import WorkflowFactory
+
+    from aiida_wannier90_workflows.utils.workflows.plot.bands import (
+        get_workchain_fermi_energy,
+    )
+
+    Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
+
+    try:
+        return get_workchain_fermi_energy(workchain), "workchain"
+    except (KeyError, ValueError, AttributeError):
+        pass
+
+    candidates = []
+    if workchain.process_class == Wannier90OptimizeWorkChain:
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_plot"))
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_optimize_iteration"))
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
+    else:
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
+
+    for label, child in candidates:
+        try:
+            return get_workchain_fermi_energy(child), f"child:{label}"
+        except (KeyError, ValueError, AttributeError):
+            continue
+
+    raise ValueError("no entries found")
+
+
+def _get_resolved_wannier_bands(workchain):
+    """Return bands node and source for workchains used in bands distance analysis."""
+    from aiida.plugins import WorkflowFactory
+
+    Wannier90BandsWorkChain = WorkflowFactory("wannier90_workflows.bands")
+    Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
+
+    candidates = []
+
+    if workchain.process_class == Wannier90OptimizeWorkChain:
+        _append_bands_candidate(
+            candidates,
+            "outputs.wannier90_optimal.interpolated_bands",
+            _safe_get_nested_output(workchain, ("wannier90_optimal", "interpolated_bands")),
+        )
+        _append_bands_candidate(
+            candidates,
+            "outputs.band_structure",
+            _safe_get_nested_output(workchain, ("band_structure",)),
+        )
+
+        for label, child in _get_called_descendants_by_prefix(workchain, "wannier90_plot"):
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.interpolated_bands",
+                _safe_get_nested_output(child, ("interpolated_bands",)),
+            )
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.band_structure",
+                _safe_get_nested_output(child, ("band_structure",)),
+            )
+
+        for label, child in reversed(_get_called_descendants_by_prefix(workchain, "wannier90_optimize_iteration")):
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.interpolated_bands",
+                _safe_get_nested_output(child, ("interpolated_bands",)),
+            )
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.band_structure",
+                _safe_get_nested_output(child, ("band_structure",)),
+            )
+
+        for label, child in _get_called_descendants_by_prefix(workchain, "wannier90"):
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.interpolated_bands",
+                _safe_get_nested_output(child, ("interpolated_bands",)),
+            )
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.band_structure",
+                _safe_get_nested_output(child, ("band_structure",)),
+            )
+
+    elif workchain.process_class == Wannier90BandsWorkChain:
+        _append_bands_candidate(
+            candidates,
+            "outputs.wannier90.interpolated_bands",
+            _safe_get_nested_output(workchain, ("wannier90", "interpolated_bands")),
+        )
+        _append_bands_candidate(
+            candidates,
+            "outputs.band_structure",
+            _safe_get_nested_output(workchain, ("band_structure",)),
+        )
+        for label, child in _get_called_descendants_by_prefix(workchain, "wannier90"):
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.interpolated_bands",
+                _safe_get_nested_output(child, ("interpolated_bands",)),
+            )
+            _append_bands_candidate(
+                candidates,
+                f"child:{label}.band_structure",
+                _safe_get_nested_output(child, ("band_structure",)),
+            )
+    else:
+        _append_bands_candidate(
+            candidates,
+            "outputs.interpolated_bands",
+            _safe_get_nested_output(workchain, ("interpolated_bands",)),
+        )
+        _append_bands_candidate(
+            candidates,
+            "outputs.band_structure",
+            _safe_get_nested_output(workchain, ("band_structure",)),
+        )
+
+    if not candidates:
+        raise ValueError("no bands outputs found")
+
+    for source, bands in candidates:
+        shape_product = _get_bands_shape_product(bands)
+        if shape_product == 0:
+            continue
+        return bands, source
+
+    raise ValueError("all candidate bands outputs are empty")
+
+
+def _format_diagnosis_message(diagnosis: dict) -> str:
+    """Format a compact user-facing diagnosis string."""
+    parts = []
+    if diagnosis["missing"]:
+        parts.append("; ".join(diagnosis["missing"]))
+    else:
+        parts.append("missing required Wannier bands outputs")
+    parts.append(f"rescue={diagnosis['can_rescue']}")
+    parts.append(f"fermi_source={diagnosis['fermi_energy_source']}")
+    parts.append(f"bands_source={diagnosis['bands_source']}")
+    return "; ".join(parts)
+
+
+def diagnose_bandsdist_workchain(workchain) -> dict:
+    """Inspect whether a workchain can be used by ``bands_distance_for_group``.
+
+    Returns a dictionary with resolved data sources and a short rescue summary.
+    """
+    diagnosis = {
+        "pk": workchain.pk,
+        "process_label": workchain.process_label,
+        "formula": workchain.inputs.structure.get_formula() if "structure" in workchain.inputs else None,
+        "fermi_energy_source": None,
+        "bands_source": None,
+        "can_rescue": False,
+        "missing": [],
+    }
+
+    try:
+        _, source = _get_resolved_fermi_energy(workchain)
+        diagnosis["fermi_energy_source"] = source
+    except (KeyError, ValueError, AttributeError) as exc:
+        diagnosis["missing"].append(f"fermi_energy: {exc}")
+
+    try:
+        _, source = _get_resolved_wannier_bands(workchain)
+        diagnosis["bands_source"] = source
+    except (KeyError, ValueError, AttributeError) as exc:
+        diagnosis["missing"].append(f"bands: {exc}")
+
+    diagnosis["can_rescue"] = diagnosis["fermi_energy_source"] is not None and diagnosis["bands_source"] is not None
+
+    return diagnosis
 
 
 def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-locals,too-many-branches
@@ -32,9 +259,6 @@ def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-lo
 
     from aiida_wannier90_workflows.utils.bands.distance import bands_distance
     from aiida_wannier90_workflows.utils.workflows.group import get_mapping_for_group
-    from aiida_wannier90_workflows.utils.workflows.plot.bands import (
-        get_workchain_fermi_energy,
-    )
 
     Wannier90BandsWorkChain = WorkflowFactory("wannier90_workflows.bands")
     Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
@@ -64,18 +288,9 @@ def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-lo
         structure = wan_wc.inputs.structure
         formula = structure.get_formula()
 
-        if not wan_wc.is_finished_ok:
-            print(f"! Skip unfinished {wan_wc.process_label}<{wan_wc.pk}> of {formula}")
-            continue
-
-        if (
-            wan_wc.process_class == Wannier90OptimizeWorkChain
-            and "optimize_reference_bands" in wan_wc.inputs
-        ):
+        if wan_wc.process_class == Wannier90OptimizeWorkChain and "optimize_reference_bands" in wan_wc.inputs:
             bands_wc = (
-                wan_wc.inputs.optimize_reference_bands.base.links.get_incoming(
-                    link_label_filter="band_structure"
-                )
+                wan_wc.inputs.optimize_reference_bands.base.links.get_incoming(link_label_filter="band_structure")
                 .one()
                 .node
             )
@@ -87,19 +302,18 @@ def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-lo
             print(msg)
             continue
 
-        if not bands_wc.is_finished_ok:
-            print(
-                f"! Skip unfinished DFT {wan_wc.process_label}<{bands_wc.pk}> of {formula}"
-            )
-            continue
         if bands_wc.process_class in (PwBaseWorkChain, PwCalculation):
+            if "output_band" not in bands_wc.outputs:
+                print(f"! Skip DFT {bands_wc.process_label}<{bands_wc.pk}> of {formula}: " "missing output_band")
+                continue
             bands_dft_node = bands_wc.outputs.output_band
         elif bands_wc.process_class == PwBandsWorkChain:
+            if "band_structure" not in bands_wc.outputs:
+                print(f"! Skip DFT {bands_wc.process_label}<{bands_wc.pk}> of {formula}: " "missing band_structure")
+                continue
             bands_dft_node = bands_wc.outputs.band_structure
         else:
-            raise ValueError(
-                f"Unsupported node type {bands_wc.process_class}<{bands_wc.pk}>"
-            )
+            raise ValueError(f"Unsupported node type {bands_wc.process_class}<{bands_wc.pk}>")
 
         if wan_wc.process_class == Wannier90Calculation:
             fermi_energy = wan_wc.inputs.parameters["fermi_energy"]
@@ -112,37 +326,34 @@ def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-lo
             Wannier90BandsWorkChain,
             Wannier90OptimizeWorkChain,
         ):
-            fermi_energy = get_workchain_fermi_energy(wan_wc)
-            # In very rare cases, the workchain did not output a correct bands,
-            # e.g. the bands file was not correctly written due to disk issue,
-            # so the outputs.band_structure might be empty.
-            # Here if the band is empty, I try to use another output BandsData,
-            # in principle they should be the same.
-            if wan_wc.process_class == Wannier90OptimizeWorkChain:
-                bands_wannier_node = wan_wc.outputs.wannier90_optimal.interpolated_bands
-            else:
-                bands_wannier_node = wan_wc.outputs.wannier90.interpolated_bands
-            if np.prod(bands_wannier_node.base.attributes.all["array|bands"]) == 0:
-                bands_wannier_node = wan_wc.outputs.band_structure
             try:
-                last_wan = (
-                    wan_wc.base.links.get_outgoing(link_label_filter="wannier90")
-                    .one()
-                    .node
+                fermi_energy, _fermi_source = _get_resolved_fermi_energy(wan_wc)
+            except (KeyError, ValueError, AttributeError) as exc:
+                print(
+                    f"! Skip {wan_wc.process_label}<{wan_wc.pk}> of {formula}: "
+                    f"cannot determine Fermi energy ({exc})"
                 )
+                continue
+            try:
+                bands_wannier_node, _bands_source = _get_resolved_wannier_bands(wan_wc)
+            except (KeyError, ValueError, AttributeError) as exc:
+                diagnosis = diagnose_bandsdist_workchain(wan_wc)
+                print(
+                    f"! Skip {wan_wc.process_label}<{wan_wc.pk}> of {formula}: "
+                    f"{exc}; {_format_diagnosis_message(diagnosis)}"
+                )
+                continue
+            try:
+                last_wan = wan_wc.base.links.get_outgoing(link_label_filter="wannier90").one().node
                 if "parameters" in last_wan.inputs:
                     exclude_list_dft = last_wan.inputs["parameters"]["exclude_bands"]
                 else:
-                    exclude_list_dft = last_wan.inputs["wannier90"]["parameters"][
-                        "exclude_bands"
-                    ]
+                    exclude_list_dft = last_wan.inputs["wannier90"]["parameters"]["exclude_bands"]
             except KeyError:
                 exclude_list_dft = []
 
         print(bands_wc.pk, wan_wc.pk)
-        dist = bands_distance(
-            bands_dft_node, bands_wannier_node, fermi_energy, exclude_list_dft
-        )
+        dist = bands_distance(bands_dft_node, bands_wannier_node, fermi_energy, exclude_list_dft)
 
         res = [formula, wan_wc.pk, bands_wc.pk, fermi_energy]
         # bands_dist_ef+{mu}

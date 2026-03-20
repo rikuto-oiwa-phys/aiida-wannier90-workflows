@@ -5,6 +5,7 @@ import typing as ty
 import matplotlib.pyplot as plt
 
 from aiida import orm
+from aiida.common.links import LinkType
 
 from aiida_quantumespresso.calculations.pw import PwCalculation
 from aiida_quantumespresso.workflows.pw.bands import PwBandsWorkChain
@@ -17,6 +18,28 @@ from aiida_wannier90_workflows.workflows.base.wannier90 import Wannier90BaseWork
 from aiida_wannier90_workflows.workflows.optimize import Wannier90OptimizeWorkChain
 from aiida_wannier90_workflows.workflows.projwfcbands import ProjwfcBandsWorkChain
 from aiida_wannier90_workflows.workflows.wannier90 import Wannier90WorkChain
+
+
+def _safe_get_nested_output(node, path: ty.Iterable[str]):
+    """Return nested output if available, otherwise ``None``."""
+    try:
+        current = node.outputs
+    except AttributeError:
+        return None
+    try:
+        for part in path:
+            current = current[part]
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return current
+
+
+def _iter_called_descendants_with_labels(node):
+    """Yield direct called descendants as ``(label, node)`` pairs."""
+    for link in node.base.links.get_outgoing().all():
+        if link.link_type not in (LinkType.CALL_CALC, LinkType.CALL_WORK):
+            continue
+        yield link.link_label, link.node
 
 
 def plot_scdm_fit_raw(  # pylint: disable=too-many-arguments
@@ -72,9 +95,7 @@ def plot_scdm_fit_raw(  # pylint: disable=too-many-arguments
     return ax
 
 
-def plot_scdm_fit(  # pylint: disable=too-many-locals
-    workchain: int, save: bool = False
-):
+def plot_scdm_fit(workchain: int, save: bool = False):  # pylint: disable=too-many-locals
     """Plot the projectabilities distribution of SCDM fitting."""
     from aiida_wannier90_workflows.utils.scdm import fit_scdm_mu_sigma
     from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
@@ -87,9 +108,7 @@ def plot_scdm_fit(  # pylint: disable=too-many-locals
 
     # w90calc = workchain.get_outgoing(link_label_filter="wannier90").one().node
     w90calc = workchain.outputs.wannier90.remote_folder.creator
-    p2w_workchain = (
-        workchain.base.links.get_outgoing(link_label_filter="pw2wannier90").one().node
-    )
+    p2w_workchain = workchain.base.links.get_outgoing(link_label_filter="pw2wannier90").one().node
     p2wcalc = get_last_calcjob(p2w_workchain)
     projcalc = workchain.base.links.get_outgoing(link_label_filter="projwfc").one().node
 
@@ -99,9 +118,7 @@ def plot_scdm_fit(  # pylint: disable=too-many-locals
     projections = projcalc.outputs.projections
     bands = projcalc.outputs.bands
 
-    mu_fit, sigma_fit, data = fit_scdm_mu_sigma(
-        bands, projections, sigma_factor=orm.Float(0), return_data=True
-    )
+    mu_fit, sigma_fit, data = fit_scdm_mu_sigma(bands, projections, sigma_factor=orm.Float(0), return_data=True)
 
     print(f"{formula:6s}:")
     print(f"        fermi_energy = {fermi_energy}, mu = {mu}, sigma = {sigma}")
@@ -131,6 +148,122 @@ def plot_scdm_fit(  # pylint: disable=too-many-locals
 
     if save:
         plt.savefig(f"scdmfit_{formula}_{workchain.pk}.png")
+    else:
+        plt.show()
+
+
+def plot_cwf_fit_raw(  # pylint: disable=too-many-arguments
+    energies: ty.Sequence,
+    projectability: ty.Sequence,
+    fit_mu_min: float,
+    fit_mu_max: float,
+    fit_sigma_min: float,
+    fit_sigma_max: float,
+    opt_mu_min: float,
+    opt_mu_max: float,
+    opt_sigma_min: float,
+    opt_sigma_max: float,
+    delta: float,
+    fermi_energy: float = None,
+    *,
+    title: str = None,
+    ax: plt.Axes = None,
+) -> plt.Axes:
+    """Plot the Closest Wannier fitting."""
+    from aiida_wannier90_workflows.utils.cwf import cwf_window_function
+
+    if ax is None:
+        _, ax = plt.subplots()
+
+    ax.plot(energies, projectability, "o", label="Projectability")
+    ax.plot(
+        energies,
+        cwf_window_function(energies, fit_mu_min, fit_mu_max, fit_sigma_min, fit_sigma_max, delta),
+        label="CWF fit",
+    )
+    ax.plot(
+        energies,
+        cwf_window_function(energies, opt_mu_min, opt_mu_max, opt_sigma_min, opt_sigma_max, delta),
+        linestyle="--",
+        label="CWF opt",
+    )
+
+    ax.axvline([fit_mu_min], color="red", linestyle=":", label=r"$\mu_\mathrm{min}$")
+    ax.axvline([fit_mu_max], color="red", label=r"$\mu_\mathrm{max,fit}$")
+    ax.axvline([opt_mu_max], color="orange", label=r"$\mu_\mathrm{max,opt}$")
+
+    if fermi_energy is not None:
+        ax.axvline([fermi_energy], color="green", label=r"$E_f$")
+
+    if title is None:
+        title = "Closest Wannier fitting"
+    ax.set_title(title)
+    ax.set_xlabel("Energy [eV]")
+    ax.set_ylabel("Projectability / weight")
+    ax.legend(loc="best")
+
+    return ax
+
+
+def plot_cwf_fit(workchain: int, save: bool = False):  # pylint: disable=too-many-locals
+    """Plot the projectability distribution of Closest Wannier fitting."""
+    from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters
+    from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
+
+    valid_classes = [
+        Wannier90BandsWorkChain,
+        Wannier90OptimizeWorkChain,
+        Wannier90WorkChain,
+    ]
+    if workchain.process_class not in valid_classes:
+        raise ValueError(f"Input workchain type should be {valid_classes}")
+
+    formula = workchain.inputs.structure.get_formula()
+
+    p2w_workchain = workchain.base.links.get_outgoing(link_label_filter="pw2wannier90").one().node
+    p2wcalc = get_last_calcjob(p2w_workchain)
+
+    w90_workchain = workchain.base.links.get_outgoing(link_label_filter="wannier90").one().node
+    w90calc = get_last_calcjob(w90_workchain)
+
+    eig_content = p2wcalc.outputs.retrieved.get_object_content("aiida.eig")
+    amn_content = p2wcalc.outputs.retrieved.get_object_content("aiida.amn")
+
+    parameters = w90calc.inputs.parameters.get_dict()
+    sigma_factor = getattr(workchain.inputs, "cwf_sigma_factor", orm.Float(3.0)).value
+    delta = parameters.get("cwf_delta", 1e-12)
+
+    opt_parameters, fit_data = fit_cwf_parameters(
+        eig_content=eig_content,
+        amn_content=amn_content,
+        sigma_factor=sigma_factor,
+        delta=delta,
+        return_data=True,
+    )
+
+    fermi_energy = parameters.get("fermi_energy", None)
+
+    _, ax = plt.subplots()
+    title = f"{workchain.process_label}<{workchain.pk}>: {formula}"
+    plot_cwf_fit_raw(
+        fit_data["energies"],
+        fit_data["projectability"],
+        fit_data["fit_mu_min"],
+        fit_data["fit_mu_max"],
+        fit_data["fit_sigma_min"],
+        fit_data["fit_sigma_max"],
+        opt_parameters["cwf_mu_min"],
+        opt_parameters["cwf_mu_max"],
+        opt_parameters["cwf_sigma_min"],
+        opt_parameters["cwf_sigma_max"],
+        fit_data["delta"],
+        fermi_energy,
+        title=title,
+        ax=ax,
+    )
+
+    if save:
+        plt.savefig(f"cwffit_{formula}_{workchain.pk}.png")
     else:
         plt.show()
 
@@ -235,10 +368,10 @@ def get_output_bands(workchain):
         ProjwfcBandsWorkChain,
         Wannier90BandsWorkChain,
         Wannier90OptimizeWorkChain,
+        Wannier90Calculation,
+        Wannier90BaseWorkChain,
     ):
-        return workchain.outputs.band_structure
-    if workchain.process_class in (Wannier90Calculation, Wannier90BaseWorkChain):
-        return workchain.outputs.interpolated_bands
+        return get_workflow_output_band(workchain)
     raise ValueError(f"Unrecognized workchain type: {workchain}")
 
 
@@ -289,7 +422,7 @@ def get_workchain_fermi_energy(
         Wannier90BandsWorkChain,
         PwBandsWorkChain,
         ProjwfcBandsWorkChain,
-    ]
+    ],
 ) -> float:
     """Get Fermi energy of Wannier90BandsWorkChain.
 
@@ -321,11 +454,7 @@ def get_workchain_fermi_energy(
                 Wannier90BandsWorkChain,
                 Wannier90OptimizeWorkChain,
             ):
-                w90calc = get_last_calcjob(
-                    workchain.base.links.get_outgoing(link_label_filter="wannier90")
-                    .one()
-                    .node
-                )
+                w90calc = get_last_calcjob(workchain.base.links.get_outgoing(link_label_filter="wannier90").one().node)
             else:
                 raise ValueError(f"Cannot find fermi energy from {workchain}")
 
@@ -382,9 +511,7 @@ def export_bands_for_group(
             continue
 
         if not dft_wc.is_finished_ok:
-            print(
-                f"! Skip unfinished DFT {dft_wc.process_label}<{dft_wc.pk}> of {formula}"
-            )
+            print(f"! Skip unfinished DFT {dft_wc.process_label}<{dft_wc.pk}> of {formula}")
             continue
         dft_bands = dft_wc.outputs.output_band
 
@@ -422,9 +549,7 @@ def bands_py_to_png(py_dir: str, png_dir: str):
     for filename in globbed:
         with open(filename, encoding="utf-8") as handle:
             mplcode = "".join(handle.readlines())
-            mplcode = mplcode.replace(
-                "fig = pl.figure()", "fig = pl.figure(figsize=(16,10))"
-            )
+            mplcode = mplcode.replace("fig = pl.figure()", "fig = pl.figure(figsize=(16,10))")
             png_filename = filename.removesuffix(".py") + ".png"
             print(f"{py_dir}/{filename} -> {png_dir}/{png_filename}")
             mplcode = mplcode.replace(
@@ -517,32 +642,18 @@ def plot_band(  # pylint: disable=too-many-statements,too-many-locals,too-many-b
     further_plot_options1["linestyle"] = all_data.get("bands_linestyle", None)
     further_plot_options1["marker"] = all_data.get("bands_marker", None)
     further_plot_options1["markersize"] = all_data.get("bands_markersize", None)
-    further_plot_options1["markeredgecolor"] = all_data.get(
-        "bands_markeredgecolor", None
-    )
-    further_plot_options1["markeredgewidth"] = all_data.get(
-        "bands_markeredgewidth", None
-    )
-    further_plot_options1["markerfacecolor"] = all_data.get(
-        "bands_markerfacecolor", None
-    )
+    further_plot_options1["markeredgecolor"] = all_data.get("bands_markeredgecolor", None)
+    further_plot_options1["markeredgewidth"] = all_data.get("bands_markeredgewidth", None)
+    further_plot_options1["markerfacecolor"] = all_data.get("bands_markerfacecolor", None)
 
     # Options for second-type of bands if present (e.g. spin up vs. spin down)
     further_plot_options2 = {}
     further_plot_options2["color"] = all_data.get("bands_color2", "r")
     # Use the values of further_plot_options1 by default
-    further_plot_options2["linewidth"] = all_data.get(
-        "bands_linewidth2", further_plot_options1["linewidth"]
-    )
-    further_plot_options2["linestyle"] = all_data.get(
-        "bands_linestyle2", further_plot_options1["linestyle"]
-    )
-    further_plot_options2["marker"] = all_data.get(
-        "bands_marker2", further_plot_options1["marker"]
-    )
-    further_plot_options2["markersize"] = all_data.get(
-        "bands_markersize2", further_plot_options1["markersize"]
-    )
+    further_plot_options2["linewidth"] = all_data.get("bands_linewidth2", further_plot_options1["linewidth"])
+    further_plot_options2["linestyle"] = all_data.get("bands_linestyle2", further_plot_options1["linestyle"])
+    further_plot_options2["marker"] = all_data.get("bands_marker2", further_plot_options1["marker"])
+    further_plot_options2["markersize"] = all_data.get("bands_markersize2", further_plot_options1["markersize"])
     further_plot_options2["markeredgecolor"] = all_data.get(
         "bands_markeredgecolor2", further_plot_options1["markeredgecolor"]
     )
@@ -734,8 +845,53 @@ def get_workflow_output_band(
     # return band
 
     if isinstance(node, orm.WorkflowNode):
-        for out in ["band_structure", "output_band", "interpolated_bands"]:
+        # Prefer direct outputs first.
+        for out in ("band_structure", "output_band", "interpolated_bands"):
             if out in node.outputs:
                 return node.outputs[out]
+
+        # Then try common nested output locations.
+        candidates = (
+            ("wannier90_optimal", "interpolated_bands"),
+            ("wannier90_optimal", "band_structure"),
+            ("wannier90", "interpolated_bands"),
+            ("wannier90", "band_structure"),
+        )
+        for path in candidates:
+            band = _safe_get_nested_output(node, path)
+            if band is not None:
+                return band
+
+        # Finally, inspect direct CALL children. This rescues partially
+        # successful optimize/bands workflows whose parent did not expose
+        # `band_structure` but whose final Wannier child still has
+        # `interpolated_bands`.
+        preferred_labels = (
+            "wannier90_optimal",
+            "wannier90_plot",
+            "wannier90",
+        )
+        children = list(_iter_called_descendants_with_labels(node))
+
+        def iter_preferred():
+            for preferred in preferred_labels:
+                for label, child in children:
+                    if label == preferred or label.startswith(f"{preferred}_"):
+                        yield label, child
+            for label, child in children:
+                if label.startswith("wannier90_optimize_iteration"):
+                    yield label, child
+            for label, child in children:
+                yield label, child
+
+        seen = set()
+        for _label, child in iter_preferred():
+            if child.pk in seen:
+                continue
+            seen.add(child.pk)
+            for out in ("band_structure", "output_band", "interpolated_bands"):
+                band = _safe_get_nested_output(child, (out,))
+                if band is not None:
+                    return band
 
     raise ValueError(f"Unsupported workflow type {node}")

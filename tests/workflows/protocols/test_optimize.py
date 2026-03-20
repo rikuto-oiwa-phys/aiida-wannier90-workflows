@@ -2,6 +2,7 @@
 """Tests for the ``Wannier90OptimizeWorkChain.get_builder_from_protocol`` method."""
 import pytest
 
+from aiida import orm
 from aiida.engine import ProcessBuilder
 from aiida.plugins import WorkflowFactory
 
@@ -138,3 +139,26 @@ def test_projection_type(generate_builder_inputs):
     ]:
         parameters = namespace["wannier90"]["parameters"].get_dict()
         assert "auto_projections" in parameters
+
+
+def test_closest_wannier_inputs(generate_builder_inputs):
+    """Test configuring ``Wannier90OptimizeWorkChain`` for Closest Wannier."""
+    builder = Wannier90OptimizeWorkChain.get_builder_from_protocol(
+        **generate_builder_inputs(),
+        projection_type=WannierProjectionType.ATOMIC_PROJECTORS_QE,
+        print_summary=False,
+    )
+
+    builder.auto_cwf_parameters = orm.Bool(True)
+    builder.cwf_delta = orm.Float(1e-12)
+
+    parameters = builder.wannier90["wannier90"]["parameters"].get_dict()
+    parameters["cwf_sigma_min"] = -1000.0
+    builder.wannier90["wannier90"]["parameters"] = orm.Dict(parameters)
+
+    assert builder.auto_cwf_parameters.value is True
+    assert builder.cwf_delta.value == 1e-12
+    assert (
+        builder.wannier90["wannier90"]["parameters"].get_dict()["cwf_sigma_min"]
+        == -1000.0
+    )

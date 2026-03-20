@@ -7,6 +7,7 @@ import typing as ty
 from aiida import orm
 from aiida.common import AttributeDict
 from aiida.common.lang import type_check
+from aiida.engine import ExitCode
 from aiida.engine.processes import ProcessBuilder, ToContext, WorkChain, if_
 from aiida.orm.nodes.data.base import to_aiida_type
 
@@ -31,34 +32,28 @@ from .base.wannier90 import Wannier90BaseWorkChain
 __all__ = ["validate_inputs", "Wannier90WorkChain"]
 
 
-def validate_inputs(  # pylint: disable=unused-argument,inconsistent-return-statements
-    inputs, ctx=None
-):
+def validate_inputs(inputs, ctx=None):  # pylint: disable=unused-argument,inconsistent-return-statements
     """Validate the inputs of the entire input namespace of `Wannier90WorkChain`."""
-    # If no scf inputs, the nscf must have a `parent_folder`
+    # If no scf inputs are provided, the nscf inputs must include a parent folder.
     if "scf" not in inputs:
         if "nscf" in inputs and "parent_folder" not in inputs["nscf"]["pw"]:
             return "If skipping scf step, nscf inputs must have a `parent_folder`"
 
-    # Cannot specify both `auto_energy_windows` and `scdm_proj`
-    pw2wannier_parameters = inputs["pw2wannier90"]["pw2wannier90"][
-        "parameters"
-    ].get_dict()
+    # Cannot specify both `auto_energy_windows` and `scdm_proj`.
+    pw2wannier_parameters = inputs["pw2wannier90"]["pw2wannier90"]["parameters"].get_dict()
     auto_energy_windows = inputs["wannier90"].get("auto_energy_windows", False)
     scdm_proj = pw2wannier_parameters["inputpp"].get("scdm_proj", False)
     if auto_energy_windows and scdm_proj:
         return "`auto_energy_windows` is incompatible with SCDM"
 
-    # Cannot specify both `auto_energy_windows` and `shift_energy_windows`
+    # Cannot specify both `auto_energy_windows` and `shift_energy_windows`.
     shift_energy_windows = inputs["wannier90"].get("shift_energy_windows", False)
     if auto_energy_windows and shift_energy_windows:
         return "`auto_energy_windows` and `shift_energy_windows` are incompatible"
 
 
 # pylint: disable=fixme,too-many-lines
-class Wannier90WorkChain(
-    ProtocolMixin, WorkChain
-):  # pylint: disable=too-many-public-methods
+class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-public-methods
     """Workchain to obtain maximally localised Wannier functions (MLWF).
 
     Run the following steps:
@@ -77,18 +72,13 @@ class Wannier90WorkChain(
 
         super().define(spec)
 
-        spec.input(
-            "structure", valid_type=orm.StructureData, help="The input structure."
-        )
+        spec.input("structure", valid_type=orm.StructureData, help="The input structure.")
         spec.input(
             "clean_workdir",
             valid_type=orm.Bool,
             serializer=to_aiida_type,
             default=lambda: orm.Bool(False),
-            help=(
-                "If True, work directories of all called calculation will be cleaned "
-                "at the end of execution."
-            ),
+            help=("If True, work directories of all called calculation will be cleaned " "at the end of execution."),
         )
         spec.expose_inputs(
             PwBaseWorkChain,
@@ -159,17 +149,16 @@ class Wannier90WorkChain(
             cls.inspect_wannier90_pp,
             cls.run_pw2wannier90,
             cls.inspect_pw2wannier90,
+            if_(cls.should_fit_cwf_parameters)(
+                cls.fit_cwf_parameters,
+            ),
             cls.run_wannier90,
             cls.inspect_wannier90,
             cls.results,
         )
 
-        spec.expose_outputs(
-            PwBaseWorkChain, namespace="scf", namespace_options={"required": False}
-        )
-        spec.expose_outputs(
-            PwBaseWorkChain, namespace="nscf", namespace_options={"required": False}
-        )
+        spec.expose_outputs(PwBaseWorkChain, namespace="scf", namespace_options={"required": False})
+        spec.expose_outputs(PwBaseWorkChain, namespace="nscf", namespace_options={"required": False})
         spec.expose_outputs(
             ProjwfcBaseWorkChain,
             namespace="projwfc",
@@ -178,6 +167,37 @@ class Wannier90WorkChain(
         spec.expose_outputs(Pw2wannier90BaseWorkChain, namespace="pw2wannier90")
         spec.expose_outputs(Wannier90BaseWorkChain, namespace="wannier90_pp")
         spec.expose_outputs(Wannier90BaseWorkChain, namespace="wannier90")
+        spec.output(
+            "cwf_parameters",
+            valid_type=orm.Dict,
+            required=False,
+            help="Automatically fitted Closest Wannier parameters.",
+        )
+
+        spec.input(
+            "auto_cwf_parameters",
+            valid_type=orm.Bool,
+            serializer=to_aiida_type,
+            default=lambda: orm.Bool(False),
+            help=(
+                "If True, fit CWF parameters from retrieved `aiida.eig` and "
+                "`aiida.amn` before the final Wannier90 run."
+            ),
+        )
+        spec.input(
+            "cwf_sigma_factor",
+            valid_type=orm.Float,
+            serializer=to_aiida_type,
+            default=lambda: orm.Float(3.0),
+            help="Shift factor applied to the fitted `mu_max`.",
+        )
+        spec.input(
+            "cwf_delta",
+            valid_type=orm.Float,
+            serializer=to_aiida_type,
+            default=lambda: orm.Float(1e-12),
+            help="Value written to the Wannier90 input as `cwf_delta`.",
+        )
 
         spec.exit_code(
             420,
@@ -205,13 +225,21 @@ class Wannier90WorkChain(
             message="the Pw2wannier90BaseWorkChain sub process failed",
         )
         spec.exit_code(
+            465,
+            "ERROR_CWF_FILES_MISSING",
+            message=("the retrieved `aiida.eig` or `aiida.amn` file required for " "CWF fitting is missing"),
+        )
+        spec.exit_code(
+            466,
+            "ERROR_CWF_FITTING_FAILED",
+            message="fitting the Closest Wannier parameters failed",
+        )
+        spec.exit_code(
             470,
             "ERROR_SUB_PROCESS_FAILED_WANNIER90",
             message="the Wannier90BaseWorkChain sub process failed",
         )
-        spec.exit_code(
-            480, "ERROR_SANITY_CHECK_FAILED", message="outputs sanity check failed"
-        )
+        spec.exit_code(480, "ERROR_SANITY_CHECK_FAILED", message="outputs sanity check failed")
 
     @classmethod
     def get_protocol_filepath(cls) -> pathlib.Path:
@@ -313,7 +341,6 @@ class Wannier90WorkChain(
         )
         from aiida_wannier90_workflows.utils.workflows.builder.submit import check_codes
 
-        # Check function arguments
         codes = check_codes(codes)
         type_check(electronic_type, ElectronicType)
         type_check(spin_type, SpinType)
@@ -324,17 +351,13 @@ class Wannier90WorkChain(
             type_check(frozen_type, WannierFrozenType)
 
         if electronic_type not in [ElectronicType.METAL, ElectronicType.INSULATOR]:
-            raise NotImplementedError(
-                f"electronic type `{electronic_type}` is not supported."
-            )
+            raise NotImplementedError(f"electronic type `{electronic_type}` is not supported.")
 
         if spin_type not in [SpinType.NONE, SpinType.SPIN_ORBIT]:
             raise NotImplementedError(f"spin type `{spin_type}` is not supported.")
 
         if initial_magnetic_moments and spin_type != SpinType.COLLINEAR:
-            raise ValueError(
-                f"`initial_magnetic_moments` is specified but spin type `{spin_type}` is incompatible."
-            )
+            raise ValueError(f"`initial_magnetic_moments` is specified but spin type `{spin_type}` is incompatible.")
 
         (
             projection_type,
@@ -349,57 +372,36 @@ class Wannier90WorkChain(
 
         if projection_type == WannierProjectionType.ATOMIC_PROJECTORS_OPENMX:
             if external_projectors_path is None:
-                raise ValueError(
-                    f"Must specify `external_projectors_path` when using {projection_type}"
-                )
+                raise ValueError(f"Must specify `external_projectors_path` when using {projection_type}")
             type_check(external_projectors_path, str)
 
-        # Adapt overrides based on input arguments
-        # Note: if overrides are specified, they take precedence!
         protocol_overrides = cls.get_protocol_overrides()
 
-        # If recursive_merge get an arg = None, the arg.copy() will raise an error.
-        # When overrides is not given (default value None), it should be set to an empty dict.
         if overrides is None:
             overrides = {}
 
         if plot_wannier_functions:
-            overrides = recursive_merge(
-                protocol_overrides["plot_wannier_functions"], overrides
-            )
+            overrides = recursive_merge(protocol_overrides["plot_wannier_functions"], overrides)
 
         if retrieve_hamiltonian:
-            overrides = recursive_merge(
-                protocol_overrides["retrieve_hamiltonian"], overrides
-            )
+            overrides = recursive_merge(protocol_overrides["retrieve_hamiltonian"], overrides)
 
         if retrieve_matrices:
-            overrides = recursive_merge(
-                protocol_overrides["retrieve_matrices"], overrides
-            )
+            overrides = recursive_merge(protocol_overrides["retrieve_matrices"], overrides)
 
         if pseudo_family is None:
             if spin_type == SpinType.SPIN_ORBIT:
-                # Use fully relativistic PseudoDojo for SOC
                 pseudo_family = "PseudoDojo/0.4/PBE/FR/standard/upf"
             else:
-                # Use the one used in Wannier90BaseWorkChain
                 pseudo_family = (
                     pseudo_family
-                    or Wannier90BaseWorkChain.get_protocol_inputs(protocol=protocol)[
-                        "meta_parameters"
-                    ]["pseudo_family"]
+                    or Wannier90BaseWorkChain.get_protocol_inputs(protocol=protocol)["meta_parameters"]["pseudo_family"]
                 )
 
-        # As PwBaseWorkChain.get_builder_from_protocol() does not support SOC, we have to pass the
-        # desired parameters through the overrides. In this case we need to set the `pw.x`
-        # spin_type to SpinType.NONE, otherwise the builder will raise an error.
-        # This block should be removed once SOC is supported in PwBaseWorkChain.
+        # PwBaseWorkChain.get_builder_from_protocol() does not support SOC directly.
         spin_orbit_coupling = spin_type == SpinType.SPIN_ORBIT
         if spin_type == SpinType.NON_COLLINEAR:
-            overrides = recursive_merge(
-                protocol_overrides["spin_noncollinear"], overrides
-            )
+            overrides = recursive_merge(protocol_overrides["spin_noncollinear"], overrides)
             pw_spin_type = SpinType.NONE
         elif spin_type == SpinType.SPIN_ORBIT:
             overrides = recursive_merge(protocol_overrides["spin_orbit"], overrides)
@@ -413,12 +415,9 @@ class Wannier90WorkChain(
         builder.structure = structure
         builder.clean_workdir = orm.Bool(inputs.get("clean_workdir"))
 
-        # Prepare wannier90 builder
         wannier_overrides = inputs.get("wannier90", {})
         wannier_overrides.setdefault("meta_parameters", {})
-        wannier_overrides["meta_parameters"].setdefault(
-            "exclude_semicore", exclude_semicore
-        )
+        wannier_overrides["meta_parameters"].setdefault("exclude_semicore", exclude_semicore)
         wannier_builder = Wannier90BaseWorkChain.get_builder_from_protocol(
             code=codes["wannier90"],
             structure=structure,
@@ -431,12 +430,10 @@ class Wannier90WorkChain(
             frozen_type=frozen_type,
             pseudo_family=pseudo_family,
         )
-        # Remove workchain excluded inputs
         wannier_builder["wannier90"].pop("structure", None)
         wannier_builder.pop("clean_workdir", None)
         builder.wannier90 = wannier_builder._inputs(prune=True)
 
-        # Prepare SCF builder
         scf_overrides = inputs.get("scf", {})
         scf_overrides["pseudo_family"] = pseudo_family
         scf_builder = PwBaseWorkChain.get_builder_from_protocol(
@@ -447,24 +444,16 @@ class Wannier90WorkChain(
             electronic_type=electronic_type,
             spin_type=pw_spin_type,
         )
-        # Remove workchain excluded inputs
         scf_builder["pw"].pop("structure", None)
         scf_builder.pop("clean_workdir", None)
         builder.scf = scf_builder._inputs(prune=True)
 
-        # Prepare NSCF builder
         nscf_overrides = inputs.get("nscf", {})
         nscf_overrides["pseudo_family"] = pseudo_family
 
         num_bands = wannier_builder["wannier90"]["parameters"]["num_bands"]
-        exclude_bands = (
-            wannier_builder["wannier90"]["parameters"]
-            .get_dict()
-            .get("exclude_bands", [])
-        )
-        nscf_overrides["pw"]["parameters"]["SYSTEM"]["nbnd"] = num_bands + len(
-            exclude_bands
-        )
+        exclude_bands = wannier_builder["wannier90"]["parameters"].get_dict().get("exclude_bands", [])
+        nscf_overrides["pw"]["parameters"]["SYSTEM"]["nbnd"] = num_bands + len(exclude_bands)
 
         nscf_builder = PwBaseWorkChain.get_builder_from_protocol(
             code=codes["pw"],
@@ -474,43 +463,35 @@ class Wannier90WorkChain(
             electronic_type=electronic_type,
             spin_type=pw_spin_type,
         )
-        # Use explicit list of kpoints generated by wannier builder.
-        # Since the QE auto generated kpoints might be different from wannier90, here we explicitly
-        # generate a list of kpoint coordinates to avoid discrepancies.
+        # Use the explicit k-point list generated by the Wannier builder.
         nscf_builder.pop("kpoints_distance", None)
         nscf_builder.kpoints = wannier_builder["wannier90"]["kpoints"]
 
-        # Remove workchain excluded inputs
         nscf_builder["pw"].pop("structure", None)
         nscf_builder.pop("clean_workdir", None)
         builder.nscf = nscf_builder._inputs(prune=True)
 
-        # Prepare projwfc builder
         if projection_type == WannierProjectionType.SCDM:
             run_projwfc = True
         else:
-            if (  # pylint: disable=simplifiable-if-statement
-                frozen_type == WannierFrozenType.ENERGY_AUTO
-            ):
+            if frozen_type == WannierFrozenType.ENERGY_AUTO:
                 run_projwfc = True
             else:
                 run_projwfc = False
+
         if run_projwfc:
             projwfc_overrides = inputs.get("projwfc", {})
             projwfc_builder = ProjwfcBaseWorkChain.get_builder_from_protocol(
                 code=codes["projwfc"], protocol=protocol, overrides=projwfc_overrides
             )
-            # Remove workchain excluded inputs
             projwfc_builder.pop("clean_workdir", None)
             builder.projwfc = projwfc_builder._inputs(prune=True)
 
-        # Prepare pw2wannier90 builder
         exclude_projectors = None
         if exclude_semicore:
             pseudo_orbitals = get_pseudo_orbitals(builder["scf"]["pw"]["pseudos"])
-            exclude_projectors = get_semicore_list(
-                structure, pseudo_orbitals, spin_orbit_coupling
-            )
+            exclude_projectors = get_semicore_list(structure, pseudo_orbitals, spin_orbit_coupling)
+
         pw2wannier90_overrides = inputs.get("pw2wannier90", {})
         pw2wannier90_builder = Pw2wannier90BaseWorkChain.get_builder_from_protocol(
             code=codes["pw2wannier90"],
@@ -521,11 +502,9 @@ class Wannier90WorkChain(
             exclude_projectors=exclude_projectors,
             external_projectors_path=external_projectors_path,
         )
-        # Remove workchain excluded inputs
         pw2wannier90_builder.pop("clean_workdir", None)
         builder.pw2wannier90 = pw2wannier90_builder._inputs(prune=True)
 
-        # A dictionary containing key info of Wannierisation and will be printed when the function returns.
         if summary is None:
             summary = {}
         summary["Formula"] = structure.get_formula()
@@ -576,16 +555,12 @@ class Wannier90WorkChain(
             if self.should_run_nscf():
                 self.ctx.current_folder = self.inputs["nscf"]["pw"]["parent_folder"]
             elif self.should_run_projwfc():
-                self.ctx.current_folder = self.inputs["projwfc"]["projwfc"][
-                    "parent_folder"
-                ]
+                self.ctx.current_folder = self.inputs["projwfc"]["projwfc"]["parent_folder"]
             else:
-                self.ctx.current_folder = self.inputs["pw2wannier90"]["pw2wannier90"][
-                    "parent_folder"
-                ]
+                self.ctx.current_folder = self.inputs["pw2wannier90"]["pw2wannier90"]["parent_folder"]
 
     def should_run_scf(self) -> bool:
-        """If the 'scf' input namespace was specified, run the scf workchain."""
+        """If the `scf` input namespace is specified, run the scf workchain."""
         return "scf" in self.inputs
 
     def run_scf(self):
@@ -605,15 +580,13 @@ class Wannier90WorkChain(
         workchain = self.ctx.workchain_scf
 
         if not workchain.is_finished_ok:
-            self.report(
-                f"scf {workchain.process_label} failed with exit status {workchain.exit_status}"
-            )
+            self.report(f"scf {workchain.process_label} failed with exit status {workchain.exit_status}")
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_SCF
 
         self.ctx.current_folder = workchain.outputs.remote_folder
 
     def should_run_nscf(self) -> bool:
-        """If the `nscf` input namespace was specified, run the nscf workchain."""
+        """If the `nscf` input namespace is specified, run the nscf workchain."""
         return "nscf" in self.inputs
 
     def run_nscf(self):
@@ -634,22 +607,18 @@ class Wannier90WorkChain(
         workchain = self.ctx.workchain_nscf
 
         if not workchain.is_finished_ok:
-            self.report(
-                f"nscf {workchain.process_label} failed with exit status {workchain.exit_status}"
-            )
+            self.report(f"nscf {workchain.process_label} failed with exit status {workchain.exit_status}")
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_NSCF
 
         self.ctx.current_folder = workchain.outputs.remote_folder
 
     def should_run_projwfc(self) -> bool:
-        """If the 'projwfc' input namespace was specified, run the projwfc calculation."""
+        """If the `projwfc` input namespace is specified, run the projwfc calculation."""
         return "projwfc" in self.inputs
 
     def run_projwfc(self):
-        """Projwfc step."""
-        inputs = AttributeDict(
-            self.exposed_inputs(ProjwfcBaseWorkChain, namespace="projwfc")
-        )
+        """Run the projwfc step."""
+        inputs = AttributeDict(self.exposed_inputs(ProjwfcBaseWorkChain, namespace="projwfc"))
         inputs.projwfc.parent_folder = self.ctx.current_folder
         inputs.metadata.call_link_label = "projwfc"
 
@@ -664,31 +633,26 @@ class Wannier90WorkChain(
         workchain = self.ctx.workchain_projwfc
 
         if not workchain.is_finished_ok:
-            self.report(
-                f"{workchain.process_label} failed with exit status {workchain.exit_status}"
-            )
+            self.report(f"{workchain.process_label} failed with exit status {workchain.exit_status}")
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_PROJWFC
 
     def prepare_wannier90_pp_inputs(self):  # pylint: disable=too-many-statements
-        """Prepare the inputs of wannier90 calculation before submission.
+        """Prepare the Wannier90 post-processing inputs before submission.
 
-        This method will be called by the workchain at runtime, to fill some parameters such as
-        Fermi energy which can only be retrieved after scf step.
-        Moreover, this allows overriding the method in derived classes to further modify the inputs.
+        This method is called at runtime so that dynamic quantities such as the Fermi
+        energy can be added after earlier calculations have finished. Derived classes
+        may override this method to further modify the inputs.
         """
         from aiida_wannier90_workflows.utils.workflows.pw import (
             get_fermi_energy,
             get_fermi_energy_from_nscf,
         )
 
-        base_inputs = AttributeDict(
-            self.exposed_inputs(Wannier90BaseWorkChain, namespace="wannier90")
-        )
+        base_inputs = AttributeDict(self.exposed_inputs(Wannier90BaseWorkChain, namespace="wannier90"))
         inputs = base_inputs["wannier90"]
         inputs.structure = self.ctx.current_structure
         parameters = inputs.parameters.get_dict()
 
-        # Add Fermi energy
         if "workchain_scf" in self.ctx:
             scf_output_parameters = self.ctx.workchain_scf.outputs.output_parameters
             fermi_energy = get_fermi_energy(scf_output_parameters)
@@ -701,9 +665,22 @@ class Wannier90WorkChain(
                 raise ValueError("Cannot retrieve Fermi energy from scf or nscf output")
         parameters["fermi_energy"] = fermi_energy
 
+        if self.should_fit_cwf_parameters():
+            parameters["auto_projections"] = True
+            for key in (
+                "dis_proj_min",
+                "dis_proj_max",
+                "dis_froz_min",
+                "dis_froz_max",
+                "dis_win_min",
+                "dis_win_max",
+            ):
+                parameters.pop(key, None)
+            inputs.pop("projections", None)
+            base_inputs.pop("guiding_centres_projections", None)
+
         inputs.parameters = orm.Dict(parameters)
 
-        # Add `postproc_setup`
         if "settings" in inputs:
             settings = inputs["settings"].get_dict()
         else:
@@ -711,7 +688,8 @@ class Wannier90WorkChain(
         settings["postproc_setup"] = True
         inputs["settings"] = settings
 
-        # I should not stash files in postproc, otherwise there is a RemoteStashFolderData in outputs
+        # Do not stash files in postproc mode, otherwise a RemoteStashFolderData
+        # may appear in the outputs.
         inputs["metadata"]["options"].pop("stash", None)
 
         base_inputs["wannier90"] = inputs
@@ -729,16 +707,14 @@ class Wannier90WorkChain(
             if "bands" not in base_inputs:
                 base_inputs.bands = self.ctx.workchain_projwfc.outputs.bands
             if "bands_projections" not in base_inputs:
-                base_inputs.bands_projections = (
-                    self.ctx.workchain_projwfc.outputs.projections
-                )
+                base_inputs.bands_projections = self.ctx.workchain_projwfc.outputs.projections
 
         base_inputs["clean_workdir"] = orm.Bool(False)
 
         return base_inputs
 
     def run_wannier90_pp(self):
-        """Wannier90 post processing step."""
+        """Run the Wannier90 post-processing step."""
         inputs = self.prepare_wannier90_pp_inputs()
         inputs["metadata"] = {"call_link_label": "wannier90_pp"}
 
@@ -749,47 +725,60 @@ class Wannier90WorkChain(
         return ToContext(workchain_wannier90_pp=running)
 
     def inspect_wannier90_pp(self):  # pylint: disable=inconsistent-return-statements
-        """Verify that the `Wannier90Calculation` for the wannier90 run successfully finished."""
+        """Verify that the `Wannier90Calculation` for the postproc run successfully finished."""
         workchain = self.ctx.workchain_wannier90_pp
 
         if not workchain.is_finished_ok:
-            self.report(
-                f"wannier90 postproc {workchain.process_label} failed with exit status {workchain.exit_status}"
-            )
+            self.report(f"wannier90 postproc {workchain.process_label} failed with exit status {workchain.exit_status}")
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_WANNIER90PP
 
     def prepare_pw2wannier90_inputs(self):
         """Prepare the inputs of `Pw2wannier90BaseWorkChain` before submission.
 
-        This method will be called by the workchain at runtime, so it can dynamically add/modify inputs
-        based on outputs of previous calculations, e.g. add bands and projections for calculating
-        scdm_mu/sigma from projectability, etc.
-        Moreover, it can be overridden in derived classes.
+        This method is called at runtime, so it can dynamically add or modify inputs
+        based on outputs of previous calculations, for example to add bands and
+        projections for calculating SCDM parameters from projectability.
         """
-        base_inputs = AttributeDict(
-            self.exposed_inputs(Pw2wannier90BaseWorkChain, namespace="pw2wannier90")
-        )
+        base_inputs = AttributeDict(self.exposed_inputs(Pw2wannier90BaseWorkChain, namespace="pw2wannier90"))
         inputs = base_inputs["pw2wannier90"]
         parameters = inputs.parameters.get_dict().get("inputpp", {})
+
+        if self.should_fit_cwf_parameters():
+            for key in (
+                "scdm_proj",
+                "scdm_entanglement",
+                "scdm_mu",
+                "scdm_sigma",
+            ):
+                parameters.pop(key, None)
+
+            parameters["atom_proj"] = True
+
+            if "settings" in inputs:
+                settings = inputs.settings.get_dict()
+            else:
+                settings = {}
+
+            retrieve_list = list(settings.get("additional_retrieve_list", []))
+            for filename in ("aiida.amn", "aiida.eig"):
+                if filename not in retrieve_list:
+                    retrieve_list.append(filename)
+            settings["additional_retrieve_list"] = retrieve_list
+            inputs.settings = orm.Dict(settings)
+            inputs.parameters = orm.Dict({"inputpp": parameters})
 
         scdm_proj = parameters.get("scdm_proj", False)
         scdm_entanglement = parameters.get("scdm_entanglement", None)
         scdm_mu = parameters.get("scdm_mu", None)
         scdm_sigma = parameters.get("scdm_sigma", None)
 
-        fit_scdm = (
-            scdm_proj
-            and scdm_entanglement == "erfc"
-            and (scdm_mu is None or scdm_sigma is None)
-        )
+        fit_scdm = scdm_proj and scdm_entanglement == "erfc" and (scdm_mu is None or scdm_sigma is None)
 
         if fit_scdm:
             if "workchain_projwfc" not in self.ctx:
                 raise ValueError("Needs to run projwfc for SCDM projection")
             base_inputs["bands"] = self.ctx.workchain_projwfc.outputs.bands
-            base_inputs["bands_projections"] = (
-                self.ctx.workchain_projwfc.outputs.projections
-            )
+            base_inputs["bands_projections"] = self.ctx.workchain_projwfc.outputs.projections
 
         inputs["parent_folder"] = self.ctx.current_folder
         inputs["nnkp_file"] = self.ctx.workchain_wannier90_pp.outputs.nnkp_file
@@ -814,30 +803,98 @@ class Wannier90WorkChain(
         workchain = self.ctx.workchain_pw2wannier90
 
         if not workchain.is_finished_ok:
-            self.report(
-                f"{workchain.process_label} failed with exit status {workchain.exit_status}"
-            )
+            self.report(f"{workchain.process_label} failed with exit status {workchain.exit_status}")
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_PW2WANNIER90
 
         self.ctx.current_folder = workchain.outputs.remote_folder
 
-    def prepare_wannier90_inputs(self):  # pylint: disable=too-many-statements
-        """Prepare the inputs of wannier90 calculation before submission.
+    def should_fit_cwf_parameters(self):
+        """Return whether Closest Wannier parameters should be fitted."""
+        return self.inputs.auto_cwf_parameters.value
 
-        This method will be called by the workchain at runtime, to fill some parameters such as
-        Fermi energy which can only be retrieved after scf step.
-        Moreover, this allows overriding the method in derived classes to further modify the inputs.
+    def _get_cwf_dimensions_from_amn(self):
+        """Read num_bands and num_wann from the retrieved aiida.amn file."""
+        from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
+
+        last_calc = get_last_calcjob(self.ctx.workchain_pw2wannier90)
+        if last_calc is None or "retrieved" not in last_calc.outputs:
+            return self.exit_codes.ERROR_CWF_FILES_MISSING
+
+        try:
+            amn_content = last_calc.outputs.retrieved.get_object_content("aiida.amn")
+        except (IOError, OSError, KeyError):
+            self.report("cannot read `aiida.amn` to determine CWF dimensions")
+            return self.exit_codes.ERROR_CWF_FILES_MISSING
+
+        lines = amn_content.splitlines()
+
+        if len(lines) < 2:
+            self.report("`aiida.amn` is malformed")
+            return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+        try:
+            num_bands, _num_kpoints, num_wann = map(int, lines[1].split()[:3])
+        except (ValueError, IndexError) as exc:
+            self.report(f"failed to parse `aiida.amn`: {exc}")
+            return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+        return {
+            "num_bands": num_bands,
+            "num_wann": num_wann,
+        }
+
+    def fit_cwf_parameters(self):  # pylint: disable=inconsistent-return-statements
+        """Fit Closest Wannier parameters from the retrieved pw2wannier90 files."""
+        from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters_from_contents
+        from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
+
+        last_calc = get_last_calcjob(self.ctx.workchain_pw2wannier90)
+        if last_calc is None or "retrieved" not in last_calc.outputs:
+            self.report("cannot fit CWF parameters because the pw2wannier90 retrieved " "folder is unavailable")
+            return self.exit_codes.ERROR_CWF_FILES_MISSING
+
+        try:
+            eig_content = last_calc.outputs.retrieved.get_object_content("aiida.eig")
+            amn_content = last_calc.outputs.retrieved.get_object_content("aiida.amn")
+        except (IOError, OSError, KeyError):
+            self.report("cannot fit CWF parameters because `aiida.eig` or `aiida.amn` " "was not retrieved")
+            return self.exit_codes.ERROR_CWF_FILES_MISSING
+
+        try:
+            parameters = fit_cwf_parameters_from_contents(
+                eig_content=eig_content,
+                amn_content=amn_content,
+                sigma_factor=self.inputs.cwf_sigma_factor.value,
+                delta=self.inputs.cwf_delta.value,
+            )
+        except (RuntimeError, TypeError, ValueError) as exception:
+            self.report(f"CWF fitting failed: {exception}")
+            return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+        dims = self._get_cwf_dimensions_from_amn()
+        if isinstance(dims, ExitCode):
+            return dims
+
+        self.ctx.cwf_parameters = orm.Dict(dict=parameters)
+        self.ctx.cwf_dimensions = orm.Dict(dict=dims)
+
+        self.report("fitted CWF parameters: " + ", ".join(f"{key}={value:.8f}" for key, value in parameters.items()))
+        self.report("CWF dimensions from aiida.amn: " f"num_bands={dims['num_bands']}, num_wann={dims['num_wann']}")
+
+    def prepare_wannier90_inputs(self):  # pylint: disable=too-many-statements
+        """Prepare the final Wannier90 inputs before submission.
+
+        This method is called at runtime to add dynamic values and to reuse the
+        corrected inputs generated during the post-processing step.
         """
         from copy import deepcopy
 
         from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
 
-        base_inputs = AttributeDict(
-            self.exposed_inputs(Wannier90BaseWorkChain, namespace="wannier90")
-        )
+        base_inputs = AttributeDict(self.exposed_inputs(Wannier90BaseWorkChain, namespace="wannier90"))
 
-        # I need to disable Fermi energy shifting since this is done in postproc step,
-        # otherwise it will be shifted twice!
+        # Disable energy-window shifting here because it has already been handled
+        # in the post-processing step.
         base_inputs.pop("shift_energy_windows", None)
         base_inputs.pop("auto_energy_windows", None)
         base_inputs.pop("auto_energy_windows_threshold", None)
@@ -846,14 +903,15 @@ class Wannier90WorkChain(
 
         inputs = base_inputs["wannier90"]
 
-        # I should stash files, which was removed from metadata in the postproc step
+        # Save the stash settings because they were removed in postproc mode.
         stash = None
         if "stash" in inputs["metadata"]["options"]:
             stash = deepcopy(inputs["metadata"]["options"]["stash"])
 
-        # Use the Wannier90BaseWorkChain-corrected parameters
         last_calc = get_last_calcjob(self.ctx.workchain_wannier90_pp)
-        # copy postproc inputs, especially the `kmesh_tol` might have been corrected
+
+        # Reuse the corrected inputs from the postproc Wannier90 calculation.
+        # For example, `kmesh_tol` may have been adjusted there.
         for key in last_calc.inputs:
             inputs[key] = last_calc.inputs[key]
 
@@ -864,10 +922,57 @@ class Wannier90WorkChain(
         else:
             settings = {}
         settings["postproc_setup"] = False
-
         inputs.settings = settings
 
-        # Restore stash files
+        if self.should_fit_cwf_parameters():
+            parameters = inputs.parameters.get_dict()
+            parameters["auto_projections"] = True
+            parameters["guiding_centres"] = True
+            parameters["num_iter"] = 0
+            parameters["dis_num_iter"] = 0
+            parameters["use_cwf_method"] = True
+            parameters["cwf_delta"] = self.inputs.cwf_delta.value
+
+            for key in (
+                # Projection-related keys
+                "projections",
+                # Disentanglement and energy-window related keys
+                "dis_proj_min",
+                "dis_proj_max",
+                "dis_froz_min",
+                "dis_froz_max",
+                "dis_win_min",
+                "dis_win_max",
+                # Max-localisation / disentanglement iteration control
+                "conv_tol",
+                "conv_window",
+                "dis_conv_tol",
+                "num_cg_steps",
+                # SCDM-related keys
+                "scdm_mu",
+                "scdm_sigma",
+                "scdm_entanglement",
+            ):
+                parameters.pop(key, None)
+
+            if "cwf_parameters" not in self.ctx:
+                return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+            if "cwf_dimensions" not in self.ctx:
+                return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+            for key, value in self.ctx.cwf_parameters.get_dict().items():
+                if key not in parameters:
+                    parameters[key] = value
+
+            cwf_dimensions = self.ctx.cwf_dimensions.get_dict()
+            parameters["num_bands"] = cwf_dimensions["num_bands"]
+            parameters["num_wann"] = cwf_dimensions["num_wann"]
+
+            inputs.pop("projections", None)
+            base_inputs.pop("guiding_centres_projections", None)
+            inputs.parameters = orm.Dict(parameters)
+
         if stash:
             options = deepcopy(inputs["metadata"]["options"])
             options["stash"] = stash
@@ -879,8 +984,11 @@ class Wannier90WorkChain(
         return base_inputs
 
     def run_wannier90(self):
-        """Wannier90 step for MLWF."""
+        """Run the final Wannier90 step for MLWF."""
         inputs = self.prepare_wannier90_inputs()
+        if isinstance(inputs, ExitCode):
+            return inputs
+
         inputs["metadata"] = {"call_link_label": "wannier90"}
 
         inputs = prepare_process_inputs(Wannier90BaseWorkChain, inputs)
@@ -890,33 +998,22 @@ class Wannier90WorkChain(
         return ToContext(workchain_wannier90=running)
 
     def inspect_wannier90(self):  # pylint: disable=inconsistent-return-statements
-        """Verify that the `Wannier90BaseWorkChain` for the wannier90 run successfully finished."""
+        """Verify that the `Wannier90BaseWorkChain` for the final Wannier90 run successfully finished."""
         workchain = self.ctx.workchain_wannier90
 
         if not workchain.is_finished_ok:
-            self.report(
-                f"{workchain.process_label} failed with exit status {workchain.exit_status}"
-            )
+            self.report(f"{workchain.process_label} failed with exit status {workchain.exit_status}")
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED_WANNIER90
 
         self.ctx.current_folder = workchain.outputs.remote_folder
 
     def results(self):  # pylint: disable=inconsistent-return-statements
         """Attach the desired output nodes directly as outputs of the workchain."""
-
         if "workchain_scf" in self.ctx:
-            self.out_many(
-                self.exposed_outputs(
-                    self.ctx.workchain_scf, PwBaseWorkChain, namespace="scf"
-                )
-            )
+            self.out_many(self.exposed_outputs(self.ctx.workchain_scf, PwBaseWorkChain, namespace="scf"))
 
         if "workchain_nscf" in self.ctx:
-            self.out_many(
-                self.exposed_outputs(
-                    self.ctx.workchain_nscf, PwBaseWorkChain, namespace="nscf"
-                )
-            )
+            self.out_many(self.exposed_outputs(self.ctx.workchain_nscf, PwBaseWorkChain, namespace="nscf"))
 
         if "workchain_projwfc" in self.ctx:
             self.out_many(
@@ -948,6 +1045,8 @@ class Wannier90WorkChain(
                 namespace="wannier90",
             )
         )
+        if "cwf_parameters" in self.ctx:
+            self.out("cwf_parameters", self.ctx.cwf_parameters)
 
         result = self.sanity_check()
         if result:
@@ -956,25 +1055,18 @@ class Wannier90WorkChain(
         self.report(f"{self.get_name()} successfully completed")
 
     def sanity_check(self):  # pylint: disable=inconsistent-return-statements
-        """Sanity checks for final outputs.
-
-        Not necessary but it is good to check it.
-        """
+        """Run sanity checks for final outputs."""
         from aiida_wannier90_workflows.utils.pseudo import (
             get_number_of_electrons,
             get_number_of_projections,
         )
 
-        # If using external atomic projectors, disable sanity check
-        p2w_params = self.ctx.workchain_pw2wannier90.inputs["pw2wannier90"][
-            "parameters"
-        ].get_dict()["inputpp"]
+        p2w_params = self.ctx.workchain_pw2wannier90.inputs["pw2wannier90"]["parameters"].get_dict()["inputpp"]
         atom_proj = p2w_params.get("atom_proj", False)
         atom_proj_ext = p2w_params.get("atom_proj_ext", False)
         if atom_proj and atom_proj_ext:
             return
 
-        # 1. the calculated number of projections is consistent with QE projwfc.x
         check_num_projs = True
         if self.should_run_scf():
             pseudos = self.inputs["scf"]["pw"]["pseudos"]
@@ -982,53 +1074,39 @@ class Wannier90WorkChain(
             pseudos = self.inputs["nscf"]["pw"]["pseudos"]
         else:
             check_num_projs = False
+
         if check_num_projs:
             args = {
                 "structure": self.ctx.current_structure,
-                # The type of `self.inputs['scf']['pw']['pseudos']` is AttributesFrozendict,
-                # we need to convert it to dict, otherwise get_number_of_projections will fail.
+                # `self.inputs['scf']['pw']['pseudos']` is an AttributesFrozendict,
+                # so convert it to a plain dict before passing it on.
                 "pseudos": dict(pseudos),
             }
             if "workchain_projwfc" in self.ctx:
-                num_proj = len(
-                    self.ctx.workchain_projwfc.outputs["projections"].get_orbitals()
-                )
-                params = self.ctx.workchain_wannier90.inputs["wannier90"][
-                    "parameters"
-                ].get_dict()
+                num_proj = len(self.ctx.workchain_projwfc.outputs["projections"].get_orbitals())
+                params = self.ctx.workchain_wannier90.inputs["wannier90"]["parameters"].get_dict()
                 spin_orbit_coupling = params.get("spinors", False)
-                number_of_projections = get_number_of_projections(
-                    **args, spin_orbit_coupling=spin_orbit_coupling
-                )
+                number_of_projections = get_number_of_projections(**args, spin_orbit_coupling=spin_orbit_coupling)
                 if number_of_projections != num_proj:
-                    self.report(
-                        f"number of projections {number_of_projections} != projwfc.x output {num_proj}"
-                    )
+                    self.report(f"number of projections {number_of_projections} != projwfc.x output {num_proj}")
                     return self.exit_codes.ERROR_SANITY_CHECK_FAILED
 
-        # 2. the number of electrons is consistent with QE output
-        # only check num electrons when we already know pseudos in the check num projectors step
         check_num_elecs = check_num_projs
         if "workchain_scf" in self.ctx:
-            num_elec = self.ctx.workchain_scf.outputs["output_parameters"][
-                "number_of_electrons"
-            ]
+            num_elec = self.ctx.workchain_scf.outputs["output_parameters"]["number_of_electrons"]
         elif "workchain_nscf" in self.ctx:
-            num_elec = self.ctx.workchain_nscf.outputs["output_parameters"][
-                "number_of_electrons"
-            ]
+            num_elec = self.ctx.workchain_nscf.outputs["output_parameters"]["number_of_electrons"]
         else:
             check_num_elecs = False
+
         if check_num_elecs:
             number_of_electrons = get_number_of_electrons(**args)
             if number_of_electrons != num_elec:
-                self.report(
-                    f"number of electrons {number_of_electrons} != QE output {num_elec}"
-                )
+                self.report(f"number of electrons {number_of_electrons} != QE output {num_elec}")
                 return self.exit_codes.ERROR_SANITY_CHECK_FAILED
 
     def on_terminated(self):
-        """Clean the working directories of all child calculations if `clean_workdir=True` in the inputs."""
+        """Clean the working directories of all child calculations if `clean_workdir=True`."""
         super().on_terminated()
 
         if not self.inputs.clean_workdir:
@@ -1046,6 +1124,4 @@ class Wannier90WorkChain(
                     pass
 
         if cleaned_calcs:
-            self.report(
-                f"cleaned remote folders of calculations: {' '.join(map(str, cleaned_calcs))}"
-            )
+            self.report(f"cleaned remote folders of calculations: {' '.join(map(str, cleaned_calcs))}")
