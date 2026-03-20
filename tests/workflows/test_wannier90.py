@@ -351,7 +351,7 @@ def test_prepare_wannier90_inputs_auto_cwf(
     parameters = prepared["wannier90"]["parameters"].get_dict()
 
     assert parameters["auto_projections"] is True
-    assert parameters["guiding_centres"] is True
+    assert parameters["guiding_centres"] is False
     assert parameters["num_iter"] == 0
     assert parameters["dis_num_iter"] == 0
     assert parameters["use_cwf_method"] is True
@@ -362,8 +362,6 @@ def test_prepare_wannier90_inputs_auto_cwf(
     assert parameters["cwf_sigma_min"] == -1000
     assert parameters["num_bands"] == 24
     assert parameters["num_wann"] == 8
-    assert "dis_proj_min" not in parameters
-    assert "dis_proj_max" not in parameters
     assert "dis_froz_min" not in parameters
     assert "dis_froz_max" not in parameters
     assert "dis_win_min" not in parameters

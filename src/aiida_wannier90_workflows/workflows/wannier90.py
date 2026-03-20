@@ -780,6 +780,22 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
             base_inputs["bands"] = self.ctx.workchain_projwfc.outputs.bands
             base_inputs["bands_projections"] = self.ctx.workchain_projwfc.outputs.projections
 
+        if self.should_fit_cwf_parameters():
+            parameters["atom_proj"] = True
+
+            if "settings" in inputs:
+                settings = inputs.settings.get_dict()
+            else:
+                settings = {}
+
+            retrieve_list = list(settings.get("additional_retrieve_list", []))
+            for filename in ("aiida.amn", "aiida.eig"):
+                if filename not in retrieve_list:
+                    retrieve_list.append(filename)
+            settings["additional_retrieve_list"] = retrieve_list
+            inputs.settings = orm.Dict(settings)
+            inputs.parameters = orm.Dict({"inputpp": parameters})
+
         inputs["parent_folder"] = self.ctx.current_folder
         inputs["nnkp_file"] = self.ctx.workchain_wannier90_pp.outputs.nnkp_file
 
@@ -927,7 +943,7 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
         if self.should_fit_cwf_parameters():
             parameters = inputs.parameters.get_dict()
             parameters["auto_projections"] = True
-            parameters["guiding_centres"] = True
+            parameters["guiding_centres"] = False
             parameters["num_iter"] = 0
             parameters["dis_num_iter"] = 0
             parameters["use_cwf_method"] = True
@@ -937,8 +953,8 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
                 # Projection-related keys
                 "projections",
                 # Disentanglement and energy-window related keys
-                "dis_proj_min",
-                "dis_proj_max",
+                # "dis_proj_min",
+                # "dis_proj_max",
                 "dis_froz_min",
                 "dis_froz_max",
                 "dis_win_min",
