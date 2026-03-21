@@ -31,10 +31,16 @@ def validate_inputs(inputs, ctx=None):  # pylint: disable=unused-argument
         return result
 
     parameters = inputs["wannier90"]["wannier90"]["parameters"].get_dict()
+    auto_cwf_parameters = bool(
+        getattr(inputs.get("auto_cwf_parameters", False), "value", inputs.get("auto_cwf_parameters", False))
+    )
 
     optimize_disproj = inputs.get("optimize_disproj", True)
     if optimize_disproj:
-        if all(_ not in parameters for _ in ("dis_proj_min", "dis_proj_max")):
+        if (
+            not auto_cwf_parameters
+            and all(_ not in parameters for _ in ("dis_proj_min", "dis_proj_max"))
+        ):
             return "Trying to optimize dis_proj_min/max but no dis_proj_min/max in wannier90 parameters?"
 
     if "optimize_reference_bands" in inputs and not optimize_disproj:
@@ -201,6 +207,9 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
             cls.inspect_wannier90_pp,
             cls.run_pw2wannier90,
             cls.inspect_pw2wannier90,
+            if_(cls.should_fit_cwf_parameters)(
+                cls.fit_cwf_parameters,
+            ),
             cls.run_wannier90,
             cls.inspect_wannier90,
             while_(cls.should_run_wannier90_optimize)(

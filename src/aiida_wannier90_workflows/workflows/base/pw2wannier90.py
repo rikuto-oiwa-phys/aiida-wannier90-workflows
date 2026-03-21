@@ -21,9 +21,7 @@ from .qebaserestart import QeBaseRestartWorkChain
 __all__ = ["validate_inputs_base", "validate_inputs", "Pw2wannier90BaseWorkChain"]
 
 
-def validate_inputs_base(  # pylint: disable=unused-argument
-    inputs: AttributeDict, ctx=None
-) -> None:
+def validate_inputs_base(inputs: AttributeDict, ctx=None) -> None:  # pylint: disable=unused-argument
     """Validate the inputs of the entire input namespace."""
     return
 
@@ -57,9 +55,9 @@ def validate_inputs(  # pylint: disable=unused-argument,inconsistent-return-stat
 
         # Check `bands` and `bands_projections` are consistent
         bands_num_kpoints, bands_num_bands = inputs["bands"].attributes["array|bands"]
-        projections_num_kpoints, projections_num_bands = inputs[
-            "bands_projections"
-        ].base.attributes.all["array|proj_array_0"]
+        projections_num_kpoints, projections_num_bands = inputs["bands_projections"].base.attributes.all[
+            "array|proj_array_0"
+        ]
         if bands_num_kpoints != projections_num_kpoints:
             return (
                 "`bands` and `bands_projections` have different number of kpoints: "
@@ -183,22 +181,16 @@ class Pw2wannier90BaseWorkChain(ProtocolMixin, QeBaseRestartWorkChain):
             if projection_type == WannierProjectionType.ATOMIC_PROJECTORS_OPENMX:
                 parameters["atom_proj_ext"] = True
                 if external_projectors_path is None:
-                    raise ValueError(
-                        f"Must specify `external_projectors_path` when using {projection_type}"
-                    )
+                    raise ValueError(f"Must specify `external_projectors_path` when using {projection_type}")
                 parameters["atom_proj_dir"] = external_projectors_path
 
         parameters = {"inputpp": parameters}
 
         # If overrides are provided, they take precedence over default protocol
         if overrides:
-            parameter_overrides = overrides.get(cls._inputs_namespace, {}).get(
-                "parameters", {}
-            )
+            parameter_overrides = overrides.get(cls._inputs_namespace, {}).get("parameters", {})
             parameters = recursive_merge(parameters, parameter_overrides)
-            metadata_overrides = overrides.get(cls._inputs_namespace, {}).get(
-                "metadata", {}
-            )
+            metadata_overrides = overrides.get(cls._inputs_namespace, {}).get("metadata", {})
             metadata = recursive_merge(metadata, metadata_overrides)
 
         # pylint: disable=no-member
@@ -207,9 +199,7 @@ class Pw2wannier90BaseWorkChain(ProtocolMixin, QeBaseRestartWorkChain):
         builder[cls._inputs_namespace]["parameters"] = orm.Dict(parameters)
         builder[cls._inputs_namespace]["metadata"] = metadata
         if "settings" in inputs[cls._inputs_namespace]:
-            builder[cls._inputs_namespace]["settings"] = orm.Dict(
-                dict=inputs[cls._inputs_namespace]["settings"]
-            )
+            builder[cls._inputs_namespace]["settings"] = orm.Dict(dict=inputs[cls._inputs_namespace]["settings"])
         if "settings" in inputs:
             builder["settings"] = orm.Dict(inputs["settings"])
         builder.clean_workdir = orm.Bool(inputs["clean_workdir"])
@@ -234,9 +224,7 @@ class Pw2wannier90BaseWorkChain(ProtocolMixin, QeBaseRestartWorkChain):
         """
         from aiida_wannier90_workflows.utils.scdm import fit_scdm_mu_sigma
 
-        inputs = AttributeDict(
-            self.exposed_inputs(Pw2wannier90Calculation, self._inputs_namespace)
-        )
+        inputs = AttributeDict(self.exposed_inputs(Pw2wannier90Calculation, self._inputs_namespace))
         parameters = inputs["parameters"].get_dict().get("inputpp", {})
 
         scdm_proj = parameters.get("scdm_proj", False)
@@ -244,17 +232,11 @@ class Pw2wannier90BaseWorkChain(ProtocolMixin, QeBaseRestartWorkChain):
         scdm_mu = parameters.get("scdm_mu", None)
         scdm_sigma = parameters.get("scdm_sigma", None)
 
-        fit_scdm = (
-            scdm_proj
-            and scdm_entanglement == "erfc"
-            and (scdm_mu is None or scdm_sigma is None)
-        )
+        fit_scdm = scdm_proj and scdm_entanglement == "erfc" and (scdm_mu is None or scdm_sigma is None)
 
         if scdm_entanglement == "gaussian":
             if scdm_mu is None or scdm_sigma is None:
-                raise NotImplementedError(
-                    "scdm_entanglement = gaussian but scdm_mu or scdm_sigma is empty."
-                )
+                raise NotImplementedError("scdm_entanglement = gaussian but scdm_mu or scdm_sigma is empty.")
 
         if fit_scdm:
             # pylint: disable=unbalanced-tuple-unpacking
@@ -278,9 +260,7 @@ class Pw2wannier90BaseWorkChain(ProtocolMixin, QeBaseRestartWorkChain):
 
         return inputs
 
-    @process_handler(
-        exit_codes=[_process_class.exit_codes.ERROR_OUTPUT_STDOUT_INCOMPLETE]
-    )
+    @process_handler(exit_codes=[_process_class.exit_codes.ERROR_OUTPUT_STDOUT_INCOMPLETE])
     def handle_output_stdout_incomplete(self, calculation):
         """Overide parent function."""
         return super().handle_output_stdout_incomplete(calculation)

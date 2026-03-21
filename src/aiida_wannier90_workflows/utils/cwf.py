@@ -73,10 +73,14 @@ def fit_cwf_parameters_raw(
     amn: np.ndarray,
     sigma_factor: float = 3.0,
     delta: float = 1e-12,
+    fermi_energy: ty.Optional[float] = None,
     return_data: bool = False,
 ) -> dict:
     """Fit Closest Wannier parameters from raw energy and AMN arrays."""
     import lmfit
+
+    fixed_mu_min = -300.0
+    fixed_sigma_min = 0.0
 
     projectability = np.real(np.diagonal(amn @ amn.transpose(0, 2, 1).conjugate(), axis1=1, axis2=2))
 
@@ -89,14 +93,19 @@ def fit_cwf_parameters_raw(
         )
     )
     params = lmfit.Parameters()
-    params.add("mu_min", value=np.min(energies_flat) - 10.0, min=-100.0, max=100.0)
+    if fermi_energy is None:
+        width_init = max(float(np.max(energies_flat) - fixed_mu_min) + 10.0, 1e-6)
+    else:
+        width_init = max(float(fermi_energy) - fixed_mu_min, 1e-6)
+
+    params.add("mu_min", value=fixed_mu_min, vary=False)
     params.add(
         "width",
-        value=max(float(np.max(energies_flat) - np.min(energies_flat)) + 20.0, 1e-6),
+        value=width_init,
         min=1e-6,
-        max=200.0,
+        max=np.inf,
     )
-    params.add("sigma_min", value=0.0, min=0.0, max=30.0)
+    params.add("sigma_min", value=fixed_sigma_min, vary=False)
     params.add("sigma_max", value=1.0, min=0.0, max=30.0)
 
     result_fit = model.fit(projectability_flat, params, energy=energies_flat)
@@ -133,6 +142,7 @@ def fit_cwf_parameters_from_contents(
     amn_content: str,
     sigma_factor: float = 3.0,
     delta: float = 1e-12,
+    fermi_energy: ty.Optional[float] = None,
     return_data: bool = False,
 ) -> dict:
     """Fit Closest Wannier parameters from retrieved ``eig`` and ``amn`` contents."""
@@ -147,6 +157,7 @@ def fit_cwf_parameters_from_contents(
         amn=amn,
         sigma_factor=sigma_factor,
         delta=delta,
+        fermi_energy=fermi_energy,
         return_data=return_data,
     )
 
@@ -156,6 +167,7 @@ def fit_cwf_parameters(
     amn_content: str,
     sigma_factor: float = 3.0,
     delta: float = 1e-12,
+    fermi_energy: ty.Optional[float] = None,
     return_data: bool = False,
 ):
     """Compatibility wrapper for fitting Closest Wannier parameters."""
@@ -164,5 +176,6 @@ def fit_cwf_parameters(
         amn_content=amn_content,
         sigma_factor=sigma_factor,
         delta=delta,
+        fermi_energy=fermi_energy,
         return_data=return_data,
     )

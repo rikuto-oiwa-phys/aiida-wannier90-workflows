@@ -25,11 +25,7 @@ def get_pseudo_and_cutoff(
     """
     try:
         pseudo_set = (PseudoDojoFamily, SsspFamily, CutoffsPseudoPotentialFamily)
-        pseudo_family = (
-            orm.QueryBuilder()
-            .append(pseudo_set, filters={"label": pseudo_family})
-            .one()[0]
-        )
+        pseudo_family = orm.QueryBuilder().append(pseudo_set, filters={"label": pseudo_family}).one()[0]
     except exceptions.NotExistent as exception:
         raise ValueError(
             f"required pseudo family `{pseudo_family}` is not installed. Please use `aiida-pseudo install` to"
@@ -37,9 +33,7 @@ def get_pseudo_and_cutoff(
         ) from exception
 
     try:
-        cutoff_wfc, cutoff_rho = pseudo_family.get_recommended_cutoffs(
-            structure=structure, unit="Ry"
-        )
+        cutoff_wfc, cutoff_rho = pseudo_family.get_recommended_cutoffs(structure=structure, unit="Ry")
         pseudos = pseudo_family.get_pseudos(structure=structure)
     except ValueError as exception:
         raise ValueError(
@@ -67,30 +61,14 @@ def get_pseudo_orbitals(pseudos: ty.Mapping[str, PseudoPotentialData]) -> dict:
     pseudo_data = []
     pseudo_data.append(load_pseudo_metadata("semicore/SSSP_1.1_PBEsol_efficiency.json"))
     pseudo_data.append(load_pseudo_metadata("semicore/SSSP_1.1_PBE_efficiency.json"))
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.4_PBE_SR_standard_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.4_PBE_SR_stringent_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.5_PBE_SR_standard_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.5_PBE_SR_stringent_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.4_LDA_SR_standard_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.4_LDA_SR_stringent_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.4_PBE_FR_standard_upf.json")
-    )
-    pseudo_data.append(
-        load_pseudo_metadata("semicore/PseudoDojo_0.4_PBEsol_FR_standard_upf.json")
-    )
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.4_PBE_SR_standard_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.4_PBE_SR_stringent_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.5_PBE_SR_standard_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.5_PBE_SR_stringent_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.4_LDA_SR_standard_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.4_LDA_SR_stringent_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.4_PBE_FR_standard_upf.json"))
+    pseudo_data.append(load_pseudo_metadata("semicore/PseudoDojo_0.4_PBEsol_FR_standard_upf.json"))
     pseudo_data.append(load_pseudo_metadata("semicore/pslibrary_paw_relpbe_1.0.0.json"))
 
     pseudo_orbitals = {}
@@ -100,16 +78,12 @@ def get_pseudo_orbitals(pseudos: ty.Mapping[str, PseudoPotentialData]) -> dict:
                 pseudo_orbitals[element] = data[element]
                 break
         else:
-            raise ValueError(
-                f"Cannot find pseudopotential {element} with md5 {pseudos[element].md5}"
-            )
+            raise ValueError(f"Cannot find pseudopotential {element} with md5 {pseudos[element].md5}")
 
     return pseudo_orbitals
 
 
-def get_semicore_list(
-    structure: orm.StructureData, pseudo_orbitals: dict, spin_orbit_coupling: bool
-) -> list:
+def get_semicore_list(structure: orm.StructureData, pseudo_orbitals: dict, spin_orbit_coupling: bool) -> list:
     """Get semicore states (a subset of pseudo wavefunctions) in the pseudopotential.
 
     :param structure: [description]
@@ -148,15 +122,11 @@ def get_semicore_list(
             num_orbs = label2num[orb[-1]] * nspin
             if orb in site_semicores:
                 site_semicores.remove(orb)
-                semicore_list.extend(
-                    list(range(num_pswfcs + 1, num_pswfcs + num_orbs + 1))
-                )
+                semicore_list.extend(list(range(num_pswfcs + 1, num_pswfcs + num_orbs + 1)))
             num_pswfcs += num_orbs
 
         if len(site_semicores) != 0:
-            return ValueError(
-                f"Error when processing pseudo {site.kind_name} with orbitals {pseudo_orbitals}"
-            )
+            return ValueError(f"Error when processing pseudo {site.kind_name} with orbitals {pseudo_orbitals}")
 
     return semicore_list
 
@@ -232,17 +202,11 @@ def get_number_of_projections(
     from .upf import get_number_of_projections_from_upf, get_upf_content, is_soc_pseudo
 
     if not isinstance(structure, orm.StructureData):
-        raise ValueError(
-            f"The type of structure is {type(structure)}, only aiida.orm.StructureData is accepted"
-        )
+        raise ValueError(f"The type of structure is {type(structure)}, only aiida.orm.StructureData is accepted")
     if not isinstance(pseudos, ty.Mapping):
-        raise ValueError(
-            f"The type of pseudos is {type(pseudos)}, only dict is accepted"
-        )
+        raise ValueError(f"The type of pseudos is {type(pseudos)}, only dict is accepted")
     for key, val in pseudos.items():
-        if not isinstance(key, str) or not isinstance(
-            val, (orm.UpfData, aiida_pseudo.data.pseudo.upf.UpfData)
-        ):
+        if not isinstance(key, str) or not isinstance(val, (orm.UpfData, aiida_pseudo.data.pseudo.upf.UpfData)):
             raise ValueError(
                 f"The type of <{key}, {val}> in pseudos is <{type(key)}, {type(val)}>, "
                 "only <str, aiida.orm.UpfData> type is accepted"
@@ -274,9 +238,7 @@ def get_number_of_projections(
     return tot_nprojs
 
 
-def get_projections(
-    structure: orm.StructureData, pseudos: ty.Mapping[str, orm.UpfData]
-):
+def get_projections(structure: orm.StructureData, pseudos: ty.Mapping[str, orm.UpfData]):
     """Get wannier90 projection block for the structure with a given pseudopotential files.
 
     Usage:
@@ -294,17 +256,11 @@ def get_projections(
     from .upf import get_projections_from_upf
 
     if not isinstance(structure, orm.StructureData):
-        raise ValueError(
-            f"The type of structure is {type(structure)}, only aiida.orm.StructureData is accepted"
-        )
+        raise ValueError(f"The type of structure is {type(structure)}, only aiida.orm.StructureData is accepted")
     if not isinstance(pseudos, ty.Mapping):
-        raise ValueError(
-            f"The type of pseudos is {type(pseudos)}, only dict is accepted"
-        )
+        raise ValueError(f"The type of pseudos is {type(pseudos)}, only dict is accepted")
     for key, val in pseudos.items():
-        if not isinstance(key, str) or not isinstance(
-            val, (orm.UpfData, aiida_pseudo.data.pseudo.upf.UpfData)
-        ):
+        if not isinstance(key, str) or not isinstance(val, (orm.UpfData, aiida_pseudo.data.pseudo.upf.UpfData)):
             raise ValueError(
                 f"The type of <{key}, {val}> in pseudos is <{type(key)}, {type(val)}>, "
                 "only <str, aiida.orm.UpfData> type is accepted"
@@ -320,9 +276,7 @@ def get_projections(
     return projections
 
 
-def get_number_of_electrons(
-    structure: orm.StructureData, pseudos: ty.Mapping[str, orm.UpfData]
-) -> float:
+def get_number_of_electrons(structure: orm.StructureData, pseudos: ty.Mapping[str, orm.UpfData]) -> float:
     """Get number of electrons for the structure based on pseudopotentials.
 
     Usage:
@@ -340,17 +294,11 @@ def get_number_of_electrons(
     from .upf import get_number_of_electrons_from_upf
 
     if not isinstance(structure, orm.StructureData):
-        raise ValueError(
-            f"The type of structure is {type(structure)}, only aiida.orm.StructureData is accepted"
-        )
+        raise ValueError(f"The type of structure is {type(structure)}, only aiida.orm.StructureData is accepted")
     if not isinstance(pseudos, ty.Mapping):
-        raise ValueError(
-            f"The type of pseudos is {type(pseudos)}, only dict is accepted"
-        )
+        raise ValueError(f"The type of pseudos is {type(pseudos)}, only dict is accepted")
     for key, val in pseudos.items():
-        if not isinstance(key, str) or not isinstance(
-            val, (orm.UpfData, aiida_pseudo.data.pseudo.upf.UpfData)
-        ):
+        if not isinstance(key, str) or not isinstance(val, (orm.UpfData, aiida_pseudo.data.pseudo.upf.UpfData)):
             raise ValueError(
                 f"The type of <{key}, {val}> in pseudos is <{type(key)}, {type(val)}>, "
                 "only <str, aiida.orm.UpfData> type is accepted"

@@ -614,7 +614,7 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
 
     def should_run_projwfc(self) -> bool:
         """If the `projwfc` input namespace is specified, run the projwfc calculation."""
-        return "projwfc" in self.inputs
+        return "projwfc" in self.inputs and not self.should_fit_cwf_parameters()
 
     def run_projwfc(self):
         """Run the projwfc step."""
@@ -668,8 +668,6 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
         if self.should_fit_cwf_parameters():
             parameters["auto_projections"] = True
             for key in (
-                "dis_proj_min",
-                "dis_proj_max",
                 "dis_froz_min",
                 "dis_froz_max",
                 "dis_win_min",
@@ -780,22 +778,6 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
             base_inputs["bands"] = self.ctx.workchain_projwfc.outputs.bands
             base_inputs["bands_projections"] = self.ctx.workchain_projwfc.outputs.projections
 
-        if self.should_fit_cwf_parameters():
-            parameters["atom_proj"] = True
-
-            if "settings" in inputs:
-                settings = inputs.settings.get_dict()
-            else:
-                settings = {}
-
-            retrieve_list = list(settings.get("additional_retrieve_list", []))
-            for filename in ("aiida.amn", "aiida.eig"):
-                if filename not in retrieve_list:
-                    retrieve_list.append(filename)
-            settings["additional_retrieve_list"] = retrieve_list
-            inputs.settings = orm.Dict(settings)
-            inputs.parameters = orm.Dict({"inputpp": parameters})
-
         inputs["parent_folder"] = self.ctx.current_folder
         inputs["nnkp_file"] = self.ctx.workchain_wannier90_pp.outputs.nnkp_file
 
@@ -862,6 +844,10 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
     def fit_cwf_parameters(self):  # pylint: disable=inconsistent-return-statements
         """Fit Closest Wannier parameters from the retrieved pw2wannier90 files."""
         from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters_from_contents
+        from aiida_wannier90_workflows.utils.workflows.pw import (
+            get_fermi_energy,
+            get_fermi_energy_from_nscf,
+        )
         from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
 
         last_calc = get_last_calcjob(self.ctx.workchain_pw2wannier90)
@@ -876,12 +862,21 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
             self.report("cannot fit CWF parameters because `aiida.eig` or `aiida.amn` " "was not retrieved")
             return self.exit_codes.ERROR_CWF_FILES_MISSING
 
+        if "workchain_scf" in self.ctx:
+            scf_output_parameters = self.ctx.workchain_scf.outputs.output_parameters
+            fermi_energy = get_fermi_energy(scf_output_parameters)
+        elif "workchain_nscf" in self.ctx:
+            fermi_energy = get_fermi_energy_from_nscf(self.ctx.workchain_nscf)
+        else:
+            fermi_energy = self.inputs.wannier90.wannier90.parameters.get_dict().get("fermi_energy")
+
         try:
             parameters = fit_cwf_parameters_from_contents(
                 eig_content=eig_content,
                 amn_content=amn_content,
                 sigma_factor=self.inputs.cwf_sigma_factor.value,
                 delta=self.inputs.cwf_delta.value,
+                fermi_energy=fermi_energy,
             )
         except (RuntimeError, TypeError, ValueError) as exception:
             self.report(f"CWF fitting failed: {exception}")
@@ -953,8 +948,6 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
                 # Projection-related keys
                 "projections",
                 # Disentanglement and energy-window related keys
-                # "dis_proj_min",
-                # "dis_proj_max",
                 "dis_froz_min",
                 "dis_froz_max",
                 "dis_win_min",
