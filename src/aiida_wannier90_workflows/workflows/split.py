@@ -718,8 +718,10 @@ class Wannier90SplitWorkChain(WorkChain):  # pylint: disable=too-many-public-met
                 try:
                     called_descendant.outputs.remote_folder._clean()  # pylint: disable=protected-access
                     cleaned_calcs.append(called_descendant.pk)
-                except (OSError, KeyError):
-                    pass
+                except (OSError, KeyError, RuntimeError) as exception:
+                    self.report(
+                        f"failed to clean remote folder for CalcJobNode<{called_descendant.pk}>: {exception}"
+                    )
 
         if cleaned_calcs:
             self.report(

@@ -841,25 +841,28 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
             "num_wann": num_wann,
         }
 
-    def fit_cwf_parameters(self):  # pylint: disable=inconsistent-return-statements
-        """Fit Closest Wannier parameters from the retrieved pw2wannier90 files."""
-        from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters_from_contents
+    def _get_cwf_fit_inputs(self):
+        """Return retrieved CWF fitting inputs and resolved Fermi energy."""
+        from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
         from aiida_wannier90_workflows.utils.workflows.pw import (
             get_fermi_energy,
             get_fermi_energy_from_nscf,
         )
-        from aiida_wannier90_workflows.utils.workflows import get_last_calcjob
 
         last_calc = get_last_calcjob(self.ctx.workchain_pw2wannier90)
         if last_calc is None or "retrieved" not in last_calc.outputs:
-            self.report("cannot fit CWF parameters because the pw2wannier90 retrieved " "folder is unavailable")
+            self.report(
+                "cannot fit CWF parameters because the pw2wannier90 retrieved folder is unavailable"
+            )
             return self.exit_codes.ERROR_CWF_FILES_MISSING
 
         try:
             eig_content = last_calc.outputs.retrieved.get_object_content("aiida.eig")
             amn_content = last_calc.outputs.retrieved.get_object_content("aiida.amn")
         except (IOError, OSError, KeyError):
-            self.report("cannot fit CWF parameters because `aiida.eig` or `aiida.amn` " "was not retrieved")
+            self.report(
+                "cannot fit CWF parameters because `aiida.eig` or `aiida.amn` was not retrieved"
+            )
             return self.exit_codes.ERROR_CWF_FILES_MISSING
 
         if "workchain_scf" in self.ctx:
@@ -868,19 +871,45 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
         elif "workchain_nscf" in self.ctx:
             fermi_energy = get_fermi_energy_from_nscf(self.ctx.workchain_nscf)
         else:
-            fermi_energy = self.inputs.wannier90.wannier90.parameters.get_dict().get("fermi_energy")
+            fermi_energy = self.inputs.wannier90.wannier90.parameters.get_dict().get(
+                "fermi_energy"
+            )
+
+        return {
+            "eig_content": eig_content,
+            "amn_content": amn_content,
+            "fermi_energy": fermi_energy,
+        }
+
+    def _fit_cwf_parameters_for_sigma_factor(
+        self, sigma_factor: float
+    ) -> ty.Union[dict, ExitCode]:
+        """Fit Closest Wannier parameters for a specific sigma factor."""
+        from aiida_wannier90_workflows.utils.cwf import fit_cwf_parameters_from_contents
+
+        fit_inputs = self._get_cwf_fit_inputs()
+        if isinstance(fit_inputs, ExitCode):
+            return fit_inputs
 
         try:
-            parameters = fit_cwf_parameters_from_contents(
-                eig_content=eig_content,
-                amn_content=amn_content,
-                sigma_factor=self.inputs.cwf_sigma_factor.value,
+            return fit_cwf_parameters_from_contents(
+                eig_content=fit_inputs["eig_content"],
+                amn_content=fit_inputs["amn_content"],
+                sigma_factor=sigma_factor,
                 delta=self.inputs.cwf_delta.value,
-                fermi_energy=fermi_energy,
+                fermi_energy=fit_inputs["fermi_energy"],
             )
         except (RuntimeError, TypeError, ValueError) as exception:
             self.report(f"CWF fitting failed: {exception}")
             return self.exit_codes.ERROR_CWF_FITTING_FAILED
+
+    def fit_cwf_parameters(self):  # pylint: disable=inconsistent-return-statements
+        """Fit Closest Wannier parameters from the retrieved pw2wannier90 files."""
+        parameters = self._fit_cwf_parameters_for_sigma_factor(
+            self.inputs.cwf_sigma_factor.value
+        )
+        if isinstance(parameters, ExitCode):
+            return parameters
 
         dims = self._get_cwf_dimensions_from_amn()
         if isinstance(dims, ExitCode):
@@ -1129,8 +1158,10 @@ class Wannier90WorkChain(ProtocolMixin, WorkChain):  # pylint: disable=too-many-
                 try:
                     called_descendant.outputs.remote_folder._clean()  # pylint: disable=protected-access
                     cleaned_calcs.append(called_descendant.pk)
-                except (OSError, KeyError):
-                    pass
+                except (OSError, KeyError, RuntimeError) as exception:
+                    self.report(
+                        f"failed to clean remote folder for CalcJobNode<{called_descendant.pk}>: {exception}"
+                    )
 
         if cleaned_calcs:
             self.report(f"cleaned remote folders of calculations: {' '.join(map(str, cleaned_calcs))}")

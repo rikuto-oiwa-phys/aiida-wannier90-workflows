@@ -55,40 +55,24 @@ def _append_bands_candidate(candidates, source: str, bands):
         candidates.append((source, bands))
 
 
-def _get_resolved_fermi_energy(workchain):
-    """Get Fermi energy for bands distance, rescuing from child workchains if needed."""
-    from aiida.plugins import WorkflowFactory
+def _deduplicate_bands_candidates(candidates):
+    """Return candidate list without duplicate bands nodes, preserving order."""
+    unique = []
+    seen = set()
 
-    from aiida_wannier90_workflows.utils.workflows.plot.bands import (
-        get_workchain_fermi_energy,
-    )
-
-    Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
-
-    try:
-        return get_workchain_fermi_energy(workchain), "workchain"
-    except (KeyError, ValueError, AttributeError):
-        pass
-
-    candidates = []
-    if workchain.process_class == Wannier90OptimizeWorkChain:
-        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_plot"))
-        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_optimize_iteration"))
-        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
-    else:
-        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
-
-    for label, child in candidates:
-        try:
-            return get_workchain_fermi_energy(child), f"child:{label}"
-        except (KeyError, ValueError, AttributeError):
+    for source, bands in candidates:
+        pk = getattr(bands, "pk", None)
+        key = pk if pk is not None else id(bands)
+        if key in seen:
             continue
+        seen.add(key)
+        unique.append((source, bands))
 
-    raise ValueError("no entries found")
+    return unique
 
 
-def _get_resolved_wannier_bands(workchain):
-    """Return bands node and source for workchains used in bands distance analysis."""
+def _collect_wannier_bands_candidates(workchain):
+    """Return ordered bands candidates for workchains used in bands distance analysis."""
     from aiida.plugins import WorkflowFactory
 
     Wannier90BandsWorkChain = WorkflowFactory("wannier90_workflows.bands")
@@ -178,6 +162,83 @@ def _get_resolved_wannier_bands(workchain):
             _safe_get_nested_output(workchain, ("band_structure",)),
         )
 
+    return _deduplicate_bands_candidates(candidates)
+
+
+def _get_resolved_fermi_energy(workchain):
+    """Get Fermi energy for bands distance, rescuing from child workchains if needed."""
+    from aiida.plugins import WorkflowFactory
+
+    from aiida_wannier90_workflows.utils.workflows.plot.bands import (
+        get_workchain_fermi_energy,
+    )
+
+    Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
+
+    try:
+        return get_workchain_fermi_energy(workchain), "workchain"
+    except (KeyError, ValueError, AttributeError):
+        pass
+
+    candidates = []
+    if workchain.process_class == Wannier90OptimizeWorkChain:
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_plot"))
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_optimize_iteration"))
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
+    else:
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
+
+    for label, child in candidates:
+        try:
+            return get_workchain_fermi_energy(child), f"child:{label}"
+        except (KeyError, ValueError, AttributeError):
+            continue
+
+    raise ValueError("no entries found")
+
+
+def _extract_exclude_bands_from_process(node):
+    """Return ``exclude_bands`` from a process input namespace if available."""
+    try:
+        if "parameters" in node.inputs:
+            return node.inputs["parameters"].get_dict().get("exclude_bands", [])
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    try:
+        return node.inputs["wannier90"]["parameters"].get_dict().get("exclude_bands", [])
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    return []
+
+
+def _get_resolved_exclude_bands(workchain):
+    """Get ``exclude_bands`` for bands distance, rescuing from child workchains if needed."""
+    from aiida.plugins import WorkflowFactory
+
+    Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
+
+    candidates = []
+    if workchain.process_class == Wannier90OptimizeWorkChain:
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_plot"))
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90_optimize_iteration"))
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
+    else:
+        candidates.extend(_get_called_descendants_by_prefix(workchain, "wannier90"))
+
+    for _, child in candidates:
+        exclude_bands = _extract_exclude_bands_from_process(child)
+        if exclude_bands:
+            return exclude_bands
+
+    return []
+
+
+def _get_resolved_wannier_bands(workchain):
+    """Return bands node and source for workchains used in bands distance analysis."""
+    candidates = _collect_wannier_bands_candidates(workchain)
+
     if not candidates:
         raise ValueError("no bands outputs found")
 
@@ -188,6 +249,50 @@ def _get_resolved_wannier_bands(workchain):
         return bands, source
 
     raise ValueError("all candidate bands outputs are empty")
+
+
+def _select_best_candidate_by_distance(
+    workchain,
+    bands_dft_node,
+    fermi_energy,
+    exclude_list_dft,
+):
+    """Select the bands candidate with the smallest Ef+2eV distance."""
+    from aiida.plugins import WorkflowFactory
+
+    from aiida_wannier90_workflows.utils.bands.distance import bands_distance
+
+    Wannier90OptimizeWorkChain = WorkflowFactory("wannier90_workflows.optimize")
+
+    if workchain.process_class != Wannier90OptimizeWorkChain:
+        return _get_resolved_wannier_bands(workchain)
+
+    candidates = _collect_wannier_bands_candidates(workchain)
+    if not candidates:
+        raise ValueError("no bands outputs found")
+
+    best = None
+    best_metric = None
+
+    for source, bands in candidates:
+        shape_product = _get_bands_shape_product(bands)
+        if shape_product == 0:
+            continue
+
+        try:
+            dist = bands_distance(bands_dft_node, bands, fermi_energy, exclude_list_dft)
+            metric = float(dist[2, 1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+
+        if best_metric is None or metric < best_metric:
+            best_metric = metric
+            best = (bands, source)
+
+    if best is not None:
+        return best
+
+    raise ValueError("all candidate bands outputs are unusable")
 
 
 def _format_diagnosis_message(diagnosis: dict) -> str:
@@ -334,8 +439,14 @@ def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-lo
                     f"cannot determine Fermi energy ({exc})"
                 )
                 continue
+            exclude_list_dft = _get_resolved_exclude_bands(wan_wc)
             try:
-                bands_wannier_node, _bands_source = _get_resolved_wannier_bands(wan_wc)
+                bands_wannier_node, _bands_source = _select_best_candidate_by_distance(
+                    wan_wc,
+                    bands_dft_node,
+                    fermi_energy,
+                    exclude_list_dft,
+                )
             except (KeyError, ValueError, AttributeError) as exc:
                 diagnosis = diagnose_bandsdist_workchain(wan_wc)
                 print(
@@ -343,25 +454,17 @@ def bands_distance_for_group(  # pylint: disable=too-many-statements,too-many-lo
                     f"{exc}; {_format_diagnosis_message(diagnosis)}"
                 )
                 continue
-            try:
-                last_wan = wan_wc.base.links.get_outgoing(link_label_filter="wannier90").one().node
-                if "parameters" in last_wan.inputs:
-                    exclude_list_dft = last_wan.inputs["parameters"]["exclude_bands"]
-                else:
-                    exclude_list_dft = last_wan.inputs["wannier90"]["parameters"]["exclude_bands"]
-            except KeyError:
-                exclude_list_dft = []
 
-        print(bands_wc.pk, wan_wc.pk)
+        print(bands_wc.pk, wan_wc.pk, _bands_source)
         dist = bands_distance(bands_dft_node, bands_wannier_node, fermi_energy, exclude_list_dft)
 
-        res = [formula, wan_wc.pk, bands_wc.pk, fermi_energy]
+        res = [formula, wan_wc.pk, bands_wc.pk, float(fermi_energy)]
         # bands_dist_ef+{mu}
-        res.extend([dist[_, 1] for _ in range(len(mu_range))])
+        res.extend([float(dist[_, 1]) for _ in range(len(mu_range))])
         # bands_maxdist_ef+{mu}
-        res.extend([dist[_, 2] for _ in range(len(mu_range))])
+        res.extend([float(dist[_, 2]) for _ in range(len(mu_range))])
         # bands_maxdist2_ef+{mu}
-        res.extend([dist[_, 3] for _ in range(len(mu_range))])
+        res.extend([float(dist[_, 3]) for _ in range(len(mu_range))])
 
         result.append(res)
         print(res)

@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 
 from aiida import orm
-from aiida.engine import ProcessBuilder, ToContext, append_, if_, while_
+from aiida.engine import ExitCode, ProcessBuilder, ToContext, append_, if_, while_
 from aiida.orm.nodes.data.base import to_aiida_type
 
 from aiida_quantumespresso.utils.mapping import prepare_process_inputs
@@ -35,7 +35,10 @@ def validate_inputs(inputs, ctx=None):  # pylint: disable=unused-argument
         getattr(inputs.get("auto_cwf_parameters", False), "value", inputs.get("auto_cwf_parameters", False))
     )
 
-    optimize_disproj = inputs.get("optimize_disproj", True)
+    optimize_disproj = bool(
+        getattr(inputs.get("optimize_disproj", True), "value", inputs.get("optimize_disproj", True))
+    )
+    optimize_sigma = "optimize_sigma_factor_range" in inputs
     if optimize_disproj:
         if (
             not auto_cwf_parameters
@@ -43,9 +46,12 @@ def validate_inputs(inputs, ctx=None):  # pylint: disable=unused-argument
         ):
             return "Trying to optimize dis_proj_min/max but no dis_proj_min/max in wannier90 parameters?"
 
-    if "optimize_reference_bands" in inputs and not optimize_disproj:
+    if optimize_sigma and not auto_cwf_parameters:
+        return "`optimize_sigma_factor_range` requires `auto_cwf_parameters = True`"
+
+    if "optimize_reference_bands" in inputs and not (optimize_disproj or optimize_sigma):
         warnings.warn(
-            "`optimize_reference_bands` is provided but `optimize_disproj = False`?"
+            "`optimize_reference_bands` is provided but no optimization loop is enabled?"
         )
 
     if (
@@ -147,6 +153,15 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
             serializer=to_aiida_type,
             help=(
                 "The range to iterate dis_proj_max. `None` means disabling projectability disentanglement."
+            ),
+        )
+        spec.input(
+            "optimize_sigma_factor_range",
+            valid_type=orm.List,
+            required=False,
+            help=(
+                "Optional range of CWF sigma factors to try when `auto_cwf_parameters = True`. "
+                "The combination with the smallest bands distance is selected."
             ),
         )
         spec.input(
@@ -347,15 +362,13 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
         """Define the current structure in the context to be the input structure."""
         super().setup()
 
-        dis_proj_min = self.inputs["optimize_disprojmin_range"].get_list()
-        dis_proj_max = self.inputs["optimize_disprojmax_range"].get_list()
-        # dis_proj_max changes the fastest
-        self.ctx.optimize_minmax_new = [
-            (i, j) for i in dis_proj_min for j in dis_proj_max
-        ]
+        self.ctx.optimize_grid = self._get_optimization_grid()
+        self.ctx.optimize_candidates_new = None
+        self.ctx.optimize_cwf_parameters = {}
 
         # Arrays to save calculated results
         self.ctx.optimize_minmax = []
+        self.ctx.optimize_sigma_factor = []
         self.ctx.optimize_bandsdist = []
         self.ctx.optimize_spreads_imbalence = []
         # The optimal wannier90 workchain
@@ -372,34 +385,110 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
                 if plot_input:
                     self.ctx.saved_parameters[key] = plot_input
 
+    def should_optimize_sigma_factor(self):
+        """Whether sigma factor should be iterated."""
+        return (
+            self.inputs.auto_cwf_parameters.value
+            and "optimize_sigma_factor_range" in self.inputs
+        )
+
+    def has_optimization_enabled(self):
+        """Whether any optimization loop is enabled."""
+        return bool(self.inputs["optimize_disproj"].value) or self.should_optimize_sigma_factor()
+
+    def _get_optimization_grid(self) -> list[dict]:
+        """Return the raw grid of optimization candidates."""
+        parameters = self.inputs.wannier90.wannier90.parameters.get_dict()
+
+        if self.inputs["optimize_disproj"].value:
+            dis_proj_min_values = self.inputs["optimize_disprojmin_range"].get_list()
+            dis_proj_max_values = self.inputs["optimize_disprojmax_range"].get_list()
+        else:
+            dis_proj_min_values = [parameters.get("dis_proj_min")]
+            dis_proj_max_values = [parameters.get("dis_proj_max")]
+
+        if self.should_optimize_sigma_factor():
+            sigma_factors = self.inputs.optimize_sigma_factor_range.get_list()
+        elif self.inputs.auto_cwf_parameters.value:
+            sigma_factors = [self.inputs.cwf_sigma_factor.value]
+        else:
+            sigma_factors = [None]
+
+        return [
+            {
+                "dis_proj_min": dis_proj_min,
+                "dis_proj_max": dis_proj_max,
+                "sigma_factor": sigma_factor,
+            }
+            for dis_proj_min in dis_proj_min_values
+            for dis_proj_max in dis_proj_max_values
+            for sigma_factor in sigma_factors
+        ]
+
+    def _get_valid_optimization_candidates(self) -> list[dict]:
+        """Return optimization candidates after filtering invalid CWF combinations."""
+        if self.ctx.optimize_candidates_new is not None:
+            return self.ctx.optimize_candidates_new
+
+        candidates = []
+        for candidate in self.ctx.optimize_grid:
+            sigma_factor = candidate["sigma_factor"]
+
+            if sigma_factor is not None:
+                sigma_factor = float(sigma_factor)
+                if sigma_factor not in self.ctx.optimize_cwf_parameters:
+                    parameters = self._fit_cwf_parameters_for_sigma_factor(sigma_factor)
+                    if isinstance(parameters, ExitCode):
+                        self.report(
+                            f"skip sigma_factor={sigma_factor} because fitting CWF parameters failed"
+                        )
+                        continue
+                    if parameters["cwf_mu_max"] < parameters["cwf_mu_min"]:
+                        self.report(
+                            f"skip sigma_factor={sigma_factor} because "
+                            f"cwf_mu_max={parameters['cwf_mu_max']:.8f} < "
+                            f"cwf_mu_min={parameters['cwf_mu_min']:.8f}"
+                        )
+                        continue
+                    self.ctx.optimize_cwf_parameters[sigma_factor] = parameters
+
+            candidates.append(candidate)
+
+        self.ctx.optimize_candidates_new = candidates
+        return candidates
+
     def should_run_wannier90_optimize(self):
-        """Whether should optimize dis_proj_min/max."""
-        if not self.inputs["optimize_disproj"]:
+        """Whether should run the optimization loop."""
+        if not self.has_optimization_enabled():
+            return False
+
+        candidates = self._get_valid_optimization_candidates()
+        if len(candidates) == 0:
             return False
 
         if "optimize_bands_distance_threshold" in self.inputs:
             threshold = self.inputs["optimize_bands_distance_threshold"]
             if self.ctx.workchain_wannier90_bandsdist <= threshold:
                 # Stop if the initial bands distance is already good enough
-                self.ctx.optimize_minmax_new = []
+                self.ctx.optimize_candidates_new = []
             else:
                 # Replace `None` by a huge number to avoid np.min error:
                 # TypeError: '<=' not supported between instances of 'float' and 'NoneType'
                 opt_dist = [_ if _ else 1e5 for _ in self.ctx.optimize_bandsdist]
                 if len(opt_dist) > 0 and np.min(opt_dist) <= threshold:
-                    self.ctx.optimize_minmax_new = []
+                    self.ctx.optimize_candidates_new = []
         elif "optimize_spreads_imbalence_threshold" in self.inputs:
             threshold = self.inputs["optimize_spreads_imbalence_threshold"]
             if self.ctx.workchain_wannier90_spreads_imbalence <= threshold:
                 # Stop if the initial spreads are already good enough
-                self.ctx.optimize_minmax_new = []
+                self.ctx.optimize_candidates_new = []
             elif (
                 len(self.ctx.optimize_spreads_imbalence) > 0
                 and np.min(self.ctx.optimize_spreads_imbalence) <= threshold
             ):
-                self.ctx.optimize_minmax_new = []
+                self.ctx.optimize_candidates_new = []
 
-        if len(self.ctx.optimize_minmax_new) == 0:
+        if len(self.ctx.optimize_candidates_new) == 0:
             return False
 
         return True
@@ -504,9 +593,25 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
 
         parameters = inputs.parameters.get_dict()
 
-        dis_proj_min, dis_proj_max = self.ctx.optimize_minmax_new[0]
-        parameters["dis_proj_min"] = dis_proj_min
-        parameters["dis_proj_max"] = dis_proj_max
+        candidate = self.ctx.optimize_candidates_new[0]
+        dis_proj_min = candidate["dis_proj_min"]
+        dis_proj_max = candidate["dis_proj_max"]
+        sigma_factor = candidate["sigma_factor"]
+
+        if dis_proj_min is not None:
+            parameters["dis_proj_min"] = dis_proj_min
+        else:
+            parameters.pop("dis_proj_min", None)
+
+        if dis_proj_max is not None:
+            parameters["dis_proj_max"] = dis_proj_max
+        else:
+            parameters.pop("dis_proj_max", None)
+
+        if sigma_factor is not None:
+            parameters["auto_projections"] = True
+            parameters["cwf_delta"] = self.inputs.cwf_delta.value
+            parameters.update(self.ctx.optimize_cwf_parameters[float(sigma_factor)])
 
         if "optimize_reference_bands" in self.inputs:
             parameters["bands_plot"] = True
@@ -545,10 +650,13 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
         inputs = prepare_process_inputs(Wannier90BaseWorkChain, inputs)
         running = self.submit(Wannier90BaseWorkChain, **inputs)
 
-        dis_proj_min, dis_proj_max = self.ctx.optimize_minmax_new[0]
+        candidate = self.ctx.optimize_candidates_new[0]
+        dis_proj_min = candidate["dis_proj_min"]
+        dis_proj_max = candidate["dis_proj_max"]
+        sigma_factor = candidate["sigma_factor"]
         self.report(
             f"launching {running.process_label}<{running.pk}> with dis_proj_min={dis_proj_min} "
-            f"dis_proj_max={dis_proj_max}"
+            f"dis_proj_max={dis_proj_max} sigma_factor={sigma_factor}"
         )
 
         return ToContext(workchain_wannier90_optimize=append_(running))
@@ -579,8 +687,10 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
             spreads = None
             bandsdist = None
 
-        minmax = self.ctx.optimize_minmax_new.pop(0)
+        candidate = self.ctx.optimize_candidates_new.pop(0)
+        minmax = (candidate["dis_proj_min"], candidate["dis_proj_max"])
         self.ctx.optimize_minmax.append(minmax)
+        self.ctx.optimize_sigma_factor.append(candidate["sigma_factor"])
         self.ctx.optimize_bandsdist.append(bandsdist)
         self.ctx.optimize_spreads_imbalence.append(spreads)
 
@@ -605,6 +715,7 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
                 self.ctx.optimize_best = workchains[idx]
                 opt_bandsdist = bandsdist[idx]
                 minmax = self.ctx.optimize_minmax[idx]
+                sigma_factor = self.ctx.optimize_sigma_factor[idx]
             else:
                 # All optimizations failed, just output the initial w90
                 self.ctx.optimize_best = self.ctx.workchain_wannier90
@@ -617,9 +728,15 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
                     params.get("dis_proj_min", None),
                     params.get("dis_proj_max", None),
                 )
+                sigma_factor = (
+                    self.inputs.cwf_sigma_factor.value
+                    if self.inputs.auto_cwf_parameters.value
+                    else None
+                )
             self.report(
                 f"Optimal bands distance={opt_bandsdist:.2e}, "
-                f"dis_proj_min={minmax[0]} dis_proj_max={minmax[1]}"
+                f"dis_proj_min={minmax[0]} dis_proj_max={minmax[1]} "
+                f"sigma_factor={sigma_factor}"
             )
         else:
             # I only check the spreads are balenced
@@ -629,9 +746,11 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
             idx = np.argmin(spreads)
             self.ctx.optimize_best = workchains[idx]
             minmax = self.ctx.optimize_minmax[idx]
+            sigma_factor = self.ctx.optimize_sigma_factor[idx]
             self.report(
                 f"Optimal spreads={spreads[idx]}, "
-                f"dis_proj_min={minmax[0]} dis_proj_max={minmax[1]}"
+                f"dis_proj_min={minmax[0]} dis_proj_max={minmax[1]} "
+                f"sigma_factor={sigma_factor}"
             )
 
         self.ctx.current_folder = self.ctx.optimize_best.outputs.remote_folder
@@ -724,7 +843,7 @@ class Wannier90OptimizeWorkChain(Wannier90BandsWorkChain):
         """Attach the relevant output nodes from the band calculation to the workchain outputs for convenience."""
         super().results()
 
-        if self.inputs["optimize_disproj"]:
+        if self.has_optimization_enabled():
             if self.has_run_wannier90_optimize():
                 optimal_workchain = self.ctx.optimize_best
             else:

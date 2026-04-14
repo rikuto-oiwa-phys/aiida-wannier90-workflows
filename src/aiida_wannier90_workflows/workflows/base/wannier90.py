@@ -376,13 +376,18 @@ class Wannier90BaseWorkChain(ProtocolMixin, BaseRestartWorkChain):
         else:
             raise ValueError(f"Unrecognized projection type {projection_type}")
 
+        has_cwf_parameters = any(key.startswith("cwf_") for key in parameters)
+
         # Set disentanglement
         if disentanglement_type == WannierDisentanglementType.NONE:
-            parameters["dis_num_iter"] = 0
-            parameters.pop("dis_froz_min", None)
-            parameters.pop("dis_froz_max", None)
-            parameters.pop("dis_win_min", None)
-            parameters.pop("dis_win_max", None)
+            # Keep user-provided CWF controls untouched. The CWF implementation
+            # relies on the standard disentanglement loop and related energy windows.
+            if not has_cwf_parameters:
+                parameters["dis_num_iter"] = 0
+                parameters.pop("dis_froz_min", None)
+                parameters.pop("dis_froz_max", None)
+                parameters.pop("dis_win_min", None)
+                parameters.pop("dis_win_max", None)
         elif disentanglement_type == WannierDisentanglementType.SMV:
             if frozen_type == WannierFrozenType.ENERGY_FIXED:
                 inputs["shift_energy_windows"] = True
